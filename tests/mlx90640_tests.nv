@@ -1,0 +1,1003 @@
+// mlx90640_tests — the calculation against the datasheet's worked example, and
+// the driver over a double of the sensor: a flat memory of 16-bit words at
+// 16-bit addresses.
+//
+// The datasheet is "MLX90640 32x24 IR array", 3901090640, revision 13.  Its
+// section 11.2.1 gives the input data (Table 11, the example pixel (12, 16) and
+// the auxiliary readings) and the calibration words 0x2410 to 0x243F (Table 12),
+// and section 11.2.2 the intermediate values.  The EEPROM word of the example
+// pixel is the one the datasheet prints for 0x258F, 0x08A0; its row and column
+// put the pixel at 0x2440 + 367 = 0x25AF, so the address printed is 0x20 low (the
+// pixel's RAM address, 0x056F, is right).  The test uses 0x25AF.
+//
+// What the datasheet's example is, and is not.  Every intermediate value of it is
+// reproduced by the functions below (the supply voltage 3.3186, the ambient
+// temperature 39.184, the gain 1.017535, the offset -75, the sensitivity
+// 1.26223e-7, the compensation pixel of subpage 0 25.6667, the first estimate
+// 80.3633 from its V_IR 679.2509).  Its V_IR, however, takes the compensation pixel
+// of subpage 1 (21.63) off a pixel of subpage 0, and the 21.63 itself disagrees with
+// the datasheet's own formula, which gives 25.78 (-56.98 + 77 * 1.075).  So the full
+// pixel is checked against an independent calculation of the datasheet's steps
+// in Python with the formulas of section 11 (the pixel of subpage 0 takes the
+// compensation pixel of subpage 0), which gives 80.216 degrees for the example's
+// inputs; the first estimate for the example's own V_IR is checked against the
+// datasheet's printed 80.3633.
+//
+// Log entries of the double: a read is 2, the register, the count, -1; a write
+// is 1, the register, the value, -1.
+//
+//   st 0 transactions   1 the transaction that fails   2 the clock in ms
+//   4 the bus clock   5 polls of the status before data is ready   6 the subpage
+//   the next data is   7 1 when data is never ready   8 1 when a write of the
+//   control register is not kept   9 the polls before the next data   10 log length
+
+use std.test
+use embedded_hal.{ BoardI2c, BoardTimer, I2cBus }
+use dev_bus.{ DeviceWiring }
+use dev_thermo.{ TempMilliC, Thermometer }
+use dev_id.{ DeviceId, Identifiable }
+use mlx90640
+use mlx90640.{ Mlx90640, MlxPort, MlxEeprom, MlxWords, MlxFrame, MlxCommon }
+
+// ── The datasheet's example ──────────────────────────────────────────
+
+fn setw(var e: MlxEeprom, addr: Int, v: Int)
+    e[addr - 0x2400] = v as u16
+
+// The calibration of Table 12; the pixel words are zero.
+fn table12() -> MlxEeprom
+    var e: MlxEeprom = Vec.new()
+    for _i in 0..832
+        let _ = e.push(0 as u16)
+    setw(var e, 0x2410, 0x4210)
+    setw(var e, 0x2411, 0xFFBB)
+    setw(var e, 0x2412, 0x0202)
+    setw(var e, 0x2413, 0xF202)
+    setw(var e, 0x2414, 0xF2F2)
+    setw(var e, 0x2415, 0xE2E2)
+    setw(var e, 0x2416, 0xD1E1)
+    setw(var e, 0x2417, 0xB1D1)
+    setw(var e, 0x2418, 0xF10F)
+    setw(var e, 0x2419, 0xF00F)
+    setw(var e, 0x241A, 0xE0EF)
+    setw(var e, 0x241B, 0xE0EF)
+    setw(var e, 0x241C, 0xE1E1)
+    setw(var e, 0x241D, 0xF3F2)
+    setw(var e, 0x241E, 0xF404)
+    setw(var e, 0x241F, 0xE504)
+    setw(var e, 0x2420, 0x79A6)
+    setw(var e, 0x2421, 0x2F44)
+    setw(var e, 0x2422, 0xFFDD)
+    setw(var e, 0x2423, 0x2210)
+    setw(var e, 0x2424, 0x3333)
+    setw(var e, 0x2425, 0x2233)
+    setw(var e, 0x2426, 0xEF01)
+    setw(var e, 0x2427, 0x9ACC)
+    setw(var e, 0x2428, 0xEEDC)
+    setw(var e, 0x2429, 0x10FF)
+    setw(var e, 0x242A, 0x2221)
+    setw(var e, 0x242B, 0x3333)
+    setw(var e, 0x242C, 0x2333)
+    setw(var e, 0x242D, 0x0112)
+    setw(var e, 0x242E, 0xEEFF)
+    setw(var e, 0x242F, 0xBBDD)
+    setw(var e, 0x2430, 0x18EF)
+    setw(var e, 0x2431, 0x2FF1)
+    setw(var e, 0x2432, 0x5952)
+    setw(var e, 0x2433, 0x9D68)
+    setw(var e, 0x2434, 0x5454)
+    setw(var e, 0x2435, 0x0994)
+    setw(var e, 0x2436, 0x6956)
+    setw(var e, 0x2437, 0x5354)
+    setw(var e, 0x2438, 0x2363)
+    setw(var e, 0x2439, 0xE446)
+    setw(var e, 0x243A, 0xFBB5)
+    setw(var e, 0x243B, 0x044B)
+    setw(var e, 0x243C, 0xF020)
+    setw(var e, 0x243D, 0x9797)
+    setw(var e, 0x243E, 0x9797)
+    setw(var e, 0x243F, 0x2889)
+    e
+
+// Table 12 with the example pixel's word at 0x25AF.
+fn example_eeprom() -> MlxEeprom
+    var e = table12()
+    setw(var e, 0x25AF, 0x08A0)
+    e
+
+// Table 12 with every pixel word 0x08A0, a good pixel, except the ones the test lists.
+fn full_eeprom() -> MlxEeprom
+    var e = table12()
+    for p in 0..768
+        setw(var e, 0x2440 + p, 0x08A0)
+    e
+
+// The words of Table 11: pixel 367 holds 609, and the auxiliary area the readings.
+fn zeros() -> MlxWords
+    var w: MlxWords = Vec.new()
+    for _i in 0..834
+        let _ = w.push(0 as u16)
+    w
+
+fn example_frame(raw: Int, ctrl: Int, sub: Int) -> MlxWords
+    var w = zeros()
+    w[367] = raw as u16
+    w[768] = 0x4BF2
+    w[776] = 0xFFCA
+    w[778] = 0x1881
+    w[800] = 0x06AF
+    w[808] = 0xFFC8
+    w[810] = 0xCCC5
+    w[832] = ctrl as u16
+    w[833] = sub as u16
+    w
+
+// A Float is within `tol` of `want`.
+fn near(got: Float, want: Float, tol: Float) -> Bool
+    got - want < tol and want - got < tol
+
+fn rel(got: Float, want: Float, tol: Float) -> Bool
+    near(got / want, 1.0, tol)
+
+@test
+fn test_the_roots_and_the_rounding() [io]
+    test.assert(near(mlx90640.sqrt_f(16.0), 4.0, 1.0e-9))
+    test.assert(near(mlx90640.sqrt_f(2.0), 1.4142135623730951, 1.0e-9))
+    test.assert(near(mlx90640.sqrt_f(0.25), 0.5, 1.0e-9))
+    test.assert(rel(mlx90640.sqrt_f(1.0e-20), 1.0e-10, 1.0e-9))
+    test.assert(rel(mlx90640.root4(9516495632.56), 312.334, 1.0e-9))
+    test.assert(near(mlx90640.root4(16.0), 2.0, 1.0e-9))
+    test.assert(rel(mlx90640.root4(3.0e-18), 4.1618e-5, 1.0e-3))
+    test.assert(mlx90640.sqrt_f(0.0) == 0.0)
+    test.assert(mlx90640.sqrt_f(-4.0) == 0.0)
+    // Outside 4 to the 62nd power the answer is the refusal, 0.
+    test.assert(mlx90640.sqrt_f(1.0e300) == 0.0)
+    test.assert(mlx90640.sqrt_f(1.0e-300) == 0.0)
+    test.assert_eq(mlx90640.round_milli(80.2164), 80216)
+    test.assert_eq(mlx90640.round_milli(80.2166), 80217)
+    test.assert_eq(mlx90640.round_milli(-80.2164), -80216)
+    test.assert_eq(mlx90640.round_milli(-80.2166), -80217)
+    test.assert_eq(mlx90640.round_milli(0.0), 0)
+
+@test
+fn test_the_field_helpers() [io]
+    test.assert_eq(mlx90640.sx(0xFF, 8), -1)
+    test.assert_eq(mlx90640.sx(0x7F, 8), 127)
+    test.assert_eq(mlx90640.sx(0x80, 8), -128)
+    test.assert_eq(mlx90640.sx(0x3B5, 10), -75)
+    test.assert_eq(mlx90640.sx(0x1FFFF, 16), -1)
+    test.assert_eq(mlx90640.nib(0x1234, 1), 4)
+    test.assert_eq(mlx90640.nib(0x1234, 4), 1)
+    test.assert(near(mlx90640.pow2(3), 8.0, 1.0e-12))
+    test.assert(near(mlx90640.pow2(-3), 0.125, 1.0e-12))
+    test.assert(near(mlx90640.pow2(0), 1.0, 1.0e-12))
+    test.assert(rel(mlx90640.pow2(37), 137438953472.0, 1.0e-12))
+
+@test
+fn test_the_supply_voltage_and_the_ambient_temperature_follow_the_example() [io]
+    var e = example_eeprom()
+    var w = example_frame(609, 0x1901, 0)
+    // Section 11.2.2.2: Kvdd -3168, Vdd25 -13056, 3.319 V.
+    let vdd = mlx90640.vdd_of(var e, var w)
+    test.assert(near(vdd, 3.3186237373737373, 1.0e-9))
+    // Section 11.2.2.3: Kv_PTAT 0.005371094, Kt_PTAT 42.25, Ta 39.184.
+    let ta = mlx90640.ta_of(var e, var w, vdd)
+    test.assert(near(ta, 39.18442378914584, 1.0e-6))
+    // Section 11.2.2.4: the gain 6383 / 6273.
+    test.assert(near(mlx90640.gain_of(var e, var w), 1.01753546947234, 1.0e-12))
+
+@test
+fn test_the_coefficients_of_pixel_367_follow_the_example() [io]
+    var e = example_eeprom()
+    // Section 11.2.2.5.2: the offset of pixel (12, 16) is -75.
+    test.assert_eq(mlx90640.pixel_offset(var e, 367), -75)
+    // Section 11.2.2.8: the sensitivity 1.26223312690854e-7.
+    test.assert(rel(mlx90640.pixel_alpha(var e, 367), 1.26223312690854e-7, 1.0e-9))
+    // Section 11.2.2.5.3: Kta 0.005126953125 and Kv 0.5.
+    test.assert(near(mlx90640.pixel_kta(var e, 367), 0.005126953125, 1.0e-12))
+    test.assert(near(mlx90640.pixel_kv(var e, 367), 0.5, 1.0e-12))
+    // The four slopes of section 11.1.10 and the corner temperatures of 11.1.9.
+    test.assert(near(mlx90640.ksto_of(var e, 0), -0.00080108642578125, 1.0e-15))
+    test.assert(near(mlx90640.ksto_of(var e, 1), -0.00080108642578125, 1.0e-15))
+    test.assert(near(mlx90640.ksto_of(var e, 2), -0.00080108642578125, 1.0e-15))
+    test.assert(near(mlx90640.ksto_of(var e, 3), -0.00080108642578125, 1.0e-15))
+    test.assert_eq(mlx90640.corner_of(var e, 3), 160)
+    test.assert_eq(mlx90640.corner_of(var e, 4), 320)
+
+@test
+fn test_the_common_values_follow_the_example() [io]
+    var e = example_eeprom()
+    var w = example_frame(609, 0x1901, 0)
+    var c = MlxCommon { vdd: 0.0, ta: 0.0, gain: 0.0, ir_cp0: 0.0, ir_cp1: 0.0, ta_tr: 0.0, tgc: 0.0,
+                        ksta: 0.0, cp_alpha0: 0.0, cp_alpha1: 0.0, emissivity: 1.0 }
+    // Reflected temperature 31 degrees, emissivity 1: the term is Ta to the fourth.
+    test.assert(mlx90640.common_of(var e, var w, 1.0, 8.18442378914584, var c))
+    // Section 11.2.2.6.2: the compensation pixel of subpage 0, 25.6667.
+    test.assert(near(c.ir_cp0, 25.66665750599561, 0.02))
+    test.assert(near(c.tgc, 1.0, 1.0e-12))
+    test.assert(near(c.ksta, -0.001953125, 1.0e-12))
+    // Section 11.2.2.8: the compensation sensitivities 4.07453626394272e-9 and
+    // 3.85171006200835e-9.
+    test.assert(rel(c.cp_alpha0, 4.07453626394272e-9, 1.0e-9))
+    test.assert(rel(c.cp_alpha1, 3.85171006200835e-9, 1.0e-9))
+    // The datasheet rounds Ta to 39.184 before the fourth power; the difference is 5e-6.
+    test.assert(rel(c.ta_tr, 9.51649563256e9, 1.0e-5))
+    // The datasheet's printed pix_CP,SP1 is 21.63; its own formula gives this.
+    test.assert(near(c.ir_cp1, 25.7813, 0.02))
+
+@test
+fn test_the_first_estimate_for_the_datasheets_v_ir_is_the_printed_80_36() [io]
+    // Section 11.2.2.9: V_IR 679.250909123826, sensitivity 1.1876487360496e-7,
+    // KsTo -0.00080108642578125 and Ta-r 9516495632.56 give 80.363312506592.
+    let to = mlx90640.to_basic(679.250909123826, 1.1876487360496e-7, -0.00080108642578125, 9516495632.56)
+    test.assert(near(to, 80.363312506592, 1.0e-4))
+
+@test
+fn test_pixel_367_over_the_example_inputs() [io]
+    var e = example_eeprom()
+    var w = example_frame(609, 0x1901, 0)
+    var c = MlxCommon { vdd: 0.0, ta: 0.0, gain: 0.0, ir_cp0: 0.0, ir_cp1: 0.0, ta_tr: 0.0, tgc: 0.0,
+                        ksta: 0.0, cp_alpha0: 0.0, cp_alpha1: 0.0, emissivity: 1.0 }
+    test.assert(mlx90640.common_of(var e, var w, 1.0, 8.18442378914584, var c))
+    // The independent calculation of the datasheet's steps gives 80.2164 degrees.
+    test.assert_eq(mlx90640.pixel_pattern(367, true), 0)
+    test.assert(near(mlx90640.pixel_to(var e, var w, c, 367), 80.21637, 0.003))
+    // The pattern of a neighbour is the other subpage; read as subpage 1 it takes the
+    // compensation pixel of subpage 1.
+    test.assert_eq(mlx90640.pixel_pattern(366, true), 1)
+
+fn pixel_at(raw: Int, ctrl: Int, sub: Int, emissivity: Float, shift: Float, p: Int) -> Float
+    var e = example_eeprom()
+    mlx90640.eeprom_set(var e)
+    setw(var e, 0x2440 + p, 0x08A0)
+    var w = example_frame(0, ctrl, sub)
+    w[p] = raw as u16
+    var c = MlxCommon { vdd: 0.0, ta: 0.0, gain: 0.0, ir_cp0: 0.0, ir_cp1: 0.0, ta_tr: 0.0, tgc: 0.0,
+                        ksta: 0.0, cp_alpha0: 0.0, cp_alpha1: 0.0, emissivity: 1.0 }
+    if not mlx90640.common_of(var e, var w, emissivity, shift, var c)
+        return -999.0
+    mlx90640.pixel_to(var e, var w, c, p)
+
+@test
+fn test_the_four_temperature_ranges_follow_the_independent_calculation() [io, mutate]
+    let shift = 8.18442378914584
+    // Range 0 (below 0 degrees): raw -800, first estimate -33.25, final -33.452.
+    test.assert(near(pixel_at(-800 & 0xFFFF, 0x1901, 0, 1.0, shift, 367), -33.452, 0.003))
+    // Range 1 (0 to CT3 = 160): raw 100 and raw 1200.
+    test.assert(near(pixel_at(100, 0x1901, 0, 1.0, shift, 367), 49.936, 0.003))
+    test.assert(near(pixel_at(1200, 0x1901, 0, 1.0, shift, 367), 108.832, 0.003))
+    // Range 2 (160 to CT4 = 320): raw 3000 and 6000.
+    test.assert(near(pixel_at(3000, 0x1901, 0, 1.0, shift, 367), 173.637, 0.005))
+    test.assert(near(pixel_at(6000, 0x1901, 0, 1.0, shift, 367), 247.410, 0.01))
+    // Range 3 (above 320): raw 12000.
+    test.assert(near(pixel_at(12000, 0x1901, 0, 1.0, shift, 367), 347.327, 0.02))
+
+@test
+fn test_the_range_of_an_estimate() [io]
+    test.assert_eq(mlx90640.range_of(-0.5, 160, 320), 0)
+    test.assert_eq(mlx90640.range_of(0.0, 160, 320), 1)
+    test.assert_eq(mlx90640.range_of(159.9, 160, 320), 1)
+    test.assert_eq(mlx90640.range_of(160.0, 160, 320), 2)
+    test.assert_eq(mlx90640.range_of(319.9, 160, 320), 2)
+    test.assert_eq(mlx90640.range_of(320.0, 160, 320), 3)
+
+@test
+fn test_emissivity_and_the_reflected_temperature_are_taken_in() [io, mutate]
+    // Emissivity 0.95 with the reflected temperature 8 degrees under the ambient.
+    test.assert(near(pixel_at(609, 0x1901, 0, 0.95, 8.0, 367), 82.355, 0.005))
+
+@test
+fn test_the_adc_resolution_corrects_the_supply_voltage_only() [io, mutate]
+    // Control register 0x1D01 is the 19-bit resolution: the supply voltage reading is
+    // scaled by 2^(2 - 3), and the other readings are not.
+    test.assert(near(pixel_at(609, 0x1D01, 0, 1.0, 8.18442378914584, 367), 82.877, 0.01))
+
+@test
+fn test_the_interleaved_pattern_uses_the_rows_and_the_corrections() [io, mutate]
+    // The sensor was calibrated in the chess pattern; read in the interleaved pattern
+    // (control bit 12 clear) the pixel takes the interleave corrections of 0x2435 and the
+    // subpage is the row parity: pixel 367 is on a row of parity 1.
+    test.assert_eq(mlx90640.pixel_pattern(367, false), 1)
+    test.assert_eq(mlx90640.pixel_pattern(0, false), 0)
+    test.assert(near(pixel_at(609, 0x0901, 1, 1.0, 8.18442378914584, 367), 80.380, 0.005))
+
+@test
+fn test_a_sensor_calibrated_in_the_interleaved_pattern_read_in_chess_takes_the_corrections() [io, mutate]
+    var e = example_eeprom()
+    setw(var e, 0x240A, 0x0800)
+    test.assert(not mlx90640.calib_chess(var e))
+    var w = example_frame(609, 0x1901, 0)
+    var c = MlxCommon { vdd: 0.0, ta: 0.0, gain: 0.0, ir_cp0: 0.0, ir_cp1: 0.0, ta_tr: 0.0, tgc: 0.0,
+                        ksta: 0.0, cp_alpha0: 0.0, cp_alpha1: 0.0, emissivity: 1.0 }
+    test.assert(mlx90640.common_of(var e, var w, 1.0, 8.18442378914584, var c))
+    test.assert(near(mlx90640.pixel_to(var e, var w, c, 367), 80.380, 0.005))
+    var e2 = example_eeprom()
+    test.assert(mlx90640.calib_chess(var e2))
+
+@test
+fn test_a_frame_that_gives_a_zero_divisor_is_refused() [io]
+    var e = example_eeprom()
+    var c = MlxCommon { vdd: 0.0, ta: 0.0, gain: 0.0, ir_cp0: 0.0, ir_cp1: 0.0, ta_tr: 0.0, tgc: 0.0,
+                        ksta: 0.0, cp_alpha0: 0.0, cp_alpha1: 0.0, emissivity: 1.0 }
+    // No readings at all: the gain word is 0.
+    var w0 = zeros()
+    test.assert(not mlx90640.common_of(var e, var w0, 1.0, 8.0, var c))
+    test.assert(mlx90640.gain_of(var e, var w0) == 0.0)
+    // PTAT and Vbe both 0: the divisor of the ambient temperature.
+    var w1 = example_frame(609, 0x1901, 0)
+    w1[800] = 0
+    w1[768] = 0
+    test.assert(mlx90640.ta_of(var e, var w1, 3.3) == 0.0)
+    test.assert(not mlx90640.common_of(var e, var w1, 1.0, 8.0, var c))
+    // An emissivity of 0 or less.
+    var w2 = example_frame(609, 0x1901, 0)
+    test.assert(not mlx90640.common_of(var e, var w2, 0.0, 8.0, var c))
+    // A voltage coefficient of 0 in the EEPROM.
+    var e3 = example_eeprom()
+    setw(var e3, 0x2433, 0x0068)
+    test.assert(mlx90640.vdd_of(var e3, var w2) == 0.0)
+    test.assert(not mlx90640.common_of(var e3, var w2, 1.0, 8.0, var c))
+    // A temperature coefficient of 0 in the EEPROM.
+    var e4 = example_eeprom()
+    setw(var e4, 0x2432, 0x5800)
+    test.assert(mlx90640.ta_of(var e4, var w2, 3.3) == 0.0)
+
+// ── A whole frame ────────────────────────────────────────────────────
+
+fn frame_words(sub: Int, ctrl: Int) -> MlxWords
+    var w = example_frame(609, ctrl, sub)
+    for p in 0..768
+        w[p] = 609
+    w
+
+@test
+fn test_a_subpage_fills_its_own_pixels_and_the_other_subpage_fills_the_rest() [io, mutate]
+    var e = full_eeprom()
+    // Pixel 5 is broken and pixel 6 an outlier.
+    setw(var e, 0x2445, 0)
+    setw(var e, 0x2446, 0x08A1)
+    var out: MlxFrame = Vec.new()
+    var w0 = frame_words(0, 0x1901)
+    test.assert(mlx90640.subpage_to(var e, var w0, 1.0, 8.0, var out))
+    test.assert_eq(out.len(), 768)
+    // Chess pattern: pixel 0 and pixel 33 are subpage 0, pixel 1 and pixel 32 are not.
+    test.assert((out[0] as Int) > 100000)
+    test.assert((out[33] as Int) > 100000)
+    test.assert_eq(out[1] as Int, 0)
+    test.assert_eq(out[32] as Int, 0)
+    // The broken pixel 5 is on subpage 1 (odd parity): untouched here.
+    test.assert_eq(out[5] as Int, 0)
+    // Pixel 0 and 33 against the independent calculation (ambient less 8 for the
+    // reflected temperature, emissivity 1: these do not depend on it).
+    test.assert(near(out[0] as Int as Float / 1000.0, 126.033, 0.01))
+    test.assert(near(out[33] as Int as Float / 1000.0, 117.326, 0.01))
+    var w1 = frame_words(1, 0x1901)
+    test.assert(mlx90640.subpage_to(var e, var w1, 1.0, 8.0, var out))
+    test.assert(near(out[1] as Int as Float / 1000.0, 116.290, 0.01))
+    test.assert_eq(out[5] as Int, mlx90640.BROKEN_MILLI_C)
+    // Pixel 6, the outlier, is on subpage 0 and was calculated by the first call.
+    test.assert((out[6] as Int) > 50000)
+    test.assert((out[32] as Int) > 100000)
+
+@test
+fn test_a_subpage_of_a_frame_with_no_gain_is_refused() [io]
+    var e = full_eeprom()
+    var out: MlxFrame = Vec.new()
+    var w = zeros()
+    test.assert(not mlx90640.subpage_to(var e, var w, 1.0, 8.0, var out))
+    test.assert_eq(out.len(), 0)
+
+@test
+fn test_the_defects_are_the_zero_words_and_the_odd_words() [io]
+    var e = full_eeprom()
+    setw(var e, 0x2440, 0)
+    setw(var e, 0x2441 + 31, 0x08A1)
+    test.assert_eq(mlx90640.pixel_defect(var e, 0), 1)
+    test.assert_eq(mlx90640.pixel_defect(var e, 32), 2)
+    test.assert_eq(mlx90640.pixel_defect(var e, 1), 0)
+
+@test
+fn test_a_defective_pixel_is_replaced_by_the_mean_of_its_good_neighbours() [io]
+    var e = full_eeprom()
+    // A broken pixel in the middle, one in the corner, one in the last row, and an outlier
+    // in the first column; none adjacent to another.
+    setw(var e, 0x2440 + 5 * 32 + 5, 0)
+    setw(var e, 0x2440, 0)
+    setw(var e, 0x2440 + 23 * 32 + 10, 0)
+    setw(var e, 0x2440 + 10 * 32, 0x08A1)
+    var out: MlxFrame = Vec.new()
+    for p in 0..768
+        let _ = out.push((p % 32 * 10) as i32)
+    out[5 * 32 + 5] = broken_px()
+    out[0] = broken_px()
+    out[23 * 32 + 10] = broken_px()
+    out[10 * 32] = 12345
+    test.assert_eq(mlx90640.defects_correct(var e, var out), 4)
+    // The middle pixel: left 40, right 60, up 50, down 50, mean 50.
+    test.assert_eq(out[5 * 32 + 5] as Int, 50)
+    // The corner: right 10 and below 0: mean 5.
+    test.assert_eq(out[0] as Int, 5)
+    // The last row, column 10: left 90, right 110, up 100: mean 100.
+    test.assert_eq(out[23 * 32 + 10] as Int, 100)
+    // The outlier in column 0: right 10, up 0, down 0: mean 3.
+    test.assert_eq(out[10 * 32] as Int, 3)
+
+fn broken_px() -> i32
+    mlx90640.BROKEN_MILLI_C as i32
+
+@test
+fn test_a_pixel_with_no_good_neighbour_is_left_as_it_was() [io]
+    var e = full_eeprom()
+    // Pixel 33 and its four neighbours all defective (the datasheet says this does not
+    // occur; the function does not divide by zero if it does).
+    for q in [33, 32, 34, 1, 65]
+        setw(var e, 0x2440 + q, 0)
+    var out: MlxFrame = Vec.new()
+    for _p in 0..768
+        let _ = out.push(7 as i32)
+    let n = mlx90640.defects_correct(var e, var out)
+    test.assert_eq(out[33] as Int, 7)
+    test.assert(n >= 4)
+
+// ── The sensor double ────────────────────────────────────────────────
+
+struct Chip
+    mem: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+fn chip() -> Chip
+    let c = Chip { mem: HashMap.new(), st: HashMap.new(), log: HashMap.new() }
+    c.mem.insert(0x800D, 0x1901)
+    c.st.insert(9, 0)
+    c
+
+fn logp(c: Chip, v: Int)
+    let n = at(c.st, 10)
+    c.log.insert(n, v)
+    c.st.insert(10, n + 1)
+
+@tier(app)
+fn log_of(c: Chip) -> [Int]
+    var out: [Int] = []
+    for i in 0..at(c.st, 10)
+        list.push(out, at(c.log, i))
+    out
+
+fn log_clear(c: Chip)
+    c.st.insert(10, 0)
+
+fn fails(c: Chip) -> Bool
+    let n = at(c.st, 0) + 1
+    c.st.insert(0, n)
+    at(c.st, 1) == n
+
+fn fail_at(c: Chip, k: Int)
+    c.st.insert(1, at(c.st, 0) + k)
+
+// Puts the words of a frame in the double's RAM.
+fn load_frame(c: Chip, var w: MlxWords)
+    for i in 0..768
+        c.mem.insert(0x0400 + i, w[i] as Int)
+    for i in 0..64
+        c.mem.insert(0x0700 + i, w[768 + i] as Int)
+    c.mem.insert(0x800D, w[832] as Int)
+
+fn load_eeprom(c: Chip, var e: MlxEeprom)
+    for i in 0..832
+        c.mem.insert(0x2400 + i, e[i] as Int)
+
+struct FakePort
+    c: Chip
+
+impl MlxPort for FakePort
+    fn setup(self, hz: Int) -> Bool [hw]
+        self.c.st.insert(4, hz)
+        at(self.c.st, 11) == 0
+
+    fn read_words(self, reg: Int, n: Int, var dst: MlxWords, at_: Int) -> Bool [hw]
+        logp(self.c, 2)
+        logp(self.c, reg)
+        logp(self.c, n)
+        logp(self.c, -1)
+        if fails(self.c)
+            return false
+        for i in 0..n
+            var v = at(self.c.mem, reg + i)
+            if reg + i == 0x8000
+                if at(self.c.st, 5) > 0
+                    self.c.st.insert(5, at(self.c.st, 5) - 1)
+                    v = 0
+                elif at(self.c.st, 7) == 1
+                    v = 0
+                else
+                    v = 0x0008 | at(self.c.st, 6)
+            if at_ + i < dst.len()
+                dst[at_ + i] = v as u16
+            else
+                let _ = dst.push(v as u16)
+        true
+
+    fn write_word(self, reg: Int, v: Int) -> Bool [hw]
+        logp(self.c, 1)
+        logp(self.c, reg)
+        logp(self.c, v)
+        logp(self.c, -1)
+        if fails(self.c)
+            return false
+        if reg == 0x8000 and v == 0x0030
+            self.c.st.insert(6, 1 - at(self.c.st, 6))
+            self.c.st.insert(5, at(self.c.st, 9))
+        if reg == 0x800D and at(self.c.st, 8) == 1
+            return true
+        self.c.mem.insert(reg, v)
+        true
+
+    fn now_ms(self) -> Int [hw]
+        at(self.c.st, 2)
+
+    fn pause_ms(self, ms: Int) [hw]
+        self.c.st.insert(2, at(self.c.st, 2) + ms)
+
+fn port() -> FakePort
+    FakePort { c: chip() }
+
+@test
+fn test_the_control_register_fields_are_changed_and_read_back() [io, hw]
+    let p = port()
+    // 0x1901: refresh code 2 (2 Hz), resolution 2 (18 bit), chess.
+    test.assert_eq(mlx90640.refresh_get(p), 2)
+    test.assert_eq(mlx90640.resolution_get(p), 2)
+    test.assert(mlx90640.refresh_set(p, 5))
+    test.assert_eq(at(p.c.mem, 0x800D), 0x1A81)
+    test.assert_eq(mlx90640.refresh_get(p), 5)
+    log_clear(p.c)
+    test.assert(mlx90640.refresh_set(p, 7))
+    // A read, a write and the read back.
+    test.assert_eq(log_of(p.c), [2, 0x800D, 1, -1, 1, 0x800D, 0x1B81, -1, 2, 0x800D, 1, -1])
+    test.assert(mlx90640.resolution_set(p, 3))
+    test.assert_eq(mlx90640.resolution_get(p), 3)
+    test.assert(mlx90640.chess_set(p, false))
+    test.assert_eq(at(p.c.mem, 0x800D) & 0x1000, 0)
+    test.assert(mlx90640.chess_set(p, true))
+    test.assert_eq(at(p.c.mem, 0x800D) & 0x1000, 0x1000)
+    // A code that does not exist is refused without a transaction.
+    log_clear(p.c)
+    test.assert(not mlx90640.refresh_set(p, 8))
+    test.assert(not mlx90640.refresh_set(p, -1))
+    test.assert(not mlx90640.resolution_set(p, 4))
+    test.assert(not mlx90640.resolution_set(p, -1))
+    test.assert_eq(log_of(p.c).len(), 0)
+
+@test
+fn test_a_control_write_that_is_not_kept_or_not_acknowledged_is_reported() [io, hw]
+    let p = port()
+    p.c.st.insert(8, 1)
+    test.assert(not mlx90640.refresh_set(p, 5))
+    p.c.st.insert(8, 0)
+    fail_at(p.c, 1)
+    test.assert(not mlx90640.refresh_set(p, 5))
+    fail_at(p.c, 2)
+    test.assert(not mlx90640.refresh_set(p, 5))
+    fail_at(p.c, 1)
+    test.assert_eq(mlx90640.refresh_get(p), -1)
+    fail_at(p.c, 1)
+    test.assert_eq(mlx90640.resolution_get(p), -1)
+
+@test
+fn test_the_refresh_rate_of_a_code_in_millihertz() [io]
+    test.assert_eq(mlx90640.refresh_mhz(0), 500)
+    test.assert_eq(mlx90640.refresh_mhz(2), 2000)
+    test.assert_eq(mlx90640.refresh_mhz(7), 64000)
+    test.assert_eq(mlx90640.refresh_mhz(8), -1)
+    test.assert_eq(mlx90640.refresh_mhz(-1), -1)
+
+@test
+fn test_the_id_is_the_three_words_at_0x2407() [io, hw]
+    let p = port()
+    p.c.mem.insert(0x2407, 0x0102)
+    p.c.mem.insert(0x2408, 0x0304)
+    p.c.mem.insert(0x2409, 0x0506)
+    let id = mlx90640.id_read(p) ?? DeviceId { who: -1, rev: None }
+    test.assert_eq(id.who, 0x010203040506)
+    test.assert(id.rev == None)
+    test.assert_eq(log_of(p.c), [2, 0x2407, 3, -1])
+    fail_at(p.c, 1)
+    test.assert(mlx90640.id_read(p) == None)
+
+@test
+fn test_the_eeprom_is_read_at_400_khz_in_pieces_of_16_words() [io, hw, mutate]
+    let p = port()
+    var e = example_eeprom()
+    load_eeprom(p.c, var e)
+    test.assert(mlx90640.eeprom_load(p))
+    test.assert_eq(at(p.c.st, 4), 400000)
+    // The port reads the 832 words in one call; the bus functions piece them.
+    test.assert_eq(log_of(p.c), [2, 0x2400, 832, -1])
+    var got: MlxEeprom = Vec.new()
+    mlx90640.eeprom_get(var got)
+    test.assert_eq(got.len(), 832)
+    test.assert_eq(got[0x30] as Int, 0x18EF)
+    test.assert_eq(got[0x40] as Int, 0)
+    // Replacing the module state.
+    var other = table12()
+    setw(var other, 0x2430, 0x1111)
+    mlx90640.eeprom_set(var other)
+    var back: MlxEeprom = Vec.new()
+    mlx90640.eeprom_get(var back)
+    test.assert_eq(back[0x30] as Int, 0x1111)
+
+@test
+fn test_a_bus_that_is_not_set_up_or_does_not_answer_loads_nothing() [io, hw, mutate]
+    let p = port()
+    p.c.st.insert(11, 1)
+    test.assert(not mlx90640.eeprom_load(p))
+    p.c.st.insert(11, 0)
+    var e = example_eeprom()
+    load_eeprom(p.c, var e)
+    fail_at(p.c, 1)
+    test.assert(not mlx90640.eeprom_load(p))
+    // A read of one value over the calibration words is not a calibration.
+    let q = port()
+    for i in 0..832
+        q.c.mem.insert(0x2400 + i, 0xFFFF)
+    test.assert(not mlx90640.eeprom_load(q))
+    let r = port()
+    test.assert(not mlx90640.eeprom_load(r))
+
+// ── Reading a subpage ────────────────────────────────────────────────
+
+@test
+fn test_a_subpage_read_waits_clears_the_bit_and_reads_the_whole_frame() [io, hw]
+    let p = port()
+    var w = example_frame(609, 0x1901, 0)
+    load_frame(p.c, var w)
+    p.c.st.insert(5, 3)
+    p.c.st.insert(6, 1)
+    var got: MlxWords = Vec.new()
+    test.assert_eq(mlx90640.frame_read(p, var got), 1)
+    test.assert_eq(got.len(), 834)
+    test.assert_eq(got[367] as Int, 609)
+    test.assert_eq(got[768] as Int, 0x4BF2)
+    test.assert_eq(got[810] as Int, 0xCCC5)
+    test.assert_eq(got[832] as Int, 0x1901)
+    test.assert_eq(got[833] as Int, 1)
+    // The status is polled until the bit is set, three polls early; the pause is 1 ms
+    // for each.
+    test.assert_eq(at(p.c.st, 2), 3)
+    var lg = log_of(p.c)
+    test.assert_eq(lg[0], 2)
+    test.assert_eq(lg[1], 0x800D)
+    // After the polls comes the write that clears the bit.
+    var wrote = -1
+    for i in 0..lg.len()
+        if lg[i] == 1 and lg[i + 1] == 0x8000 and wrote < 0
+            wrote = i
+    test.assert(wrote > 0)
+    test.assert_eq(lg[wrote + 2], 0x0030)
+    // 768 words for the pixels and 64 for the auxiliary area, a call each.
+    var pixels = 0
+    var aux = 0
+    var i = 0
+    while i < lg.len()
+        if lg[i] == 2 and lg[i + 1] >= 0x0400 and lg[i + 1] < 0x0700
+            pixels = pixels + 1
+        if lg[i] == 2 and lg[i + 1] >= 0x0700 and lg[i + 1] < 0x0740
+            aux = aux + 1
+        i = i + 1
+    test.assert_eq(pixels, 1)
+    test.assert_eq(aux, 1)
+
+@test
+fn test_a_sensor_that_never_has_data_ends_the_wait_after_twice_the_subpage() [io, hw]
+    let p = port()
+    p.c.st.insert(7, 1)
+    var got: MlxWords = Vec.new()
+    test.assert_eq(mlx90640.frame_read(p, var got), mlx90640.ERR_TIMEOUT)
+    // Refresh code 2 is 500 ms a subpage: 1010 ms.
+    test.assert(at(p.c.st, 2) >= 1010)
+    test.assert(at(p.c.st, 2) < 1100)
+
+@test
+fn test_every_transaction_of_a_subpage_read_that_fails_is_reported() [io, hw]
+    // The calls are: refresh, status, the clearing write, pixels, auxiliary area, control.
+    var k = 1
+    while k <= 6
+        let p = port()
+        var w = example_frame(609, 0x1901, 0)
+        load_frame(p.c, var w)
+        fail_at(p.c, k)
+        var got: MlxWords = Vec.new()
+        test.assert_eq(mlx90640.frame_read(p, var got), mlx90640.ERR_BUS)
+        k = k + 1
+    let q = port()
+    var w2 = example_frame(609, 0x1901, 0)
+    load_frame(q.c, var w2)
+    var ok: MlxWords = Vec.new()
+    test.assert_eq(mlx90640.frame_read(q, var ok), 0)
+    test.assert_eq(at(q.c.st, 0), 6)
+
+@test
+fn test_a_frame_with_a_word_that_met_an_update_is_not_valid() [io, hw]
+    var w = example_frame(609, 0x1901, 0)
+    // The first pixel of a line of the subpage.
+    w[64] = 0x7FFF
+    var v = zeros()
+    test.assert(mlx90640.frame_valid(var v))
+    test.assert(not mlx90640.frame_valid(var w))
+    // The same word on a line the subpage does not read is not looked at.
+    var w1 = example_frame(609, 0x1901, 1)
+    w1[64] = 0x7FFF
+    test.assert(mlx90640.frame_valid(var w1))
+    // The auxiliary words the reference driver looks at: 0, 8 to 18, 20 to 22, 24 to 32,
+    // 40 to 50, 52 to 54 and 56 to 63; and the ones it leaves.
+    for i in 0..64
+        var a = zeros()
+        a[768 + i] = 0x7FFF
+        let looked = i == 0 or i >= 8 and i < 19 or i >= 20 and i < 23 or i >= 24 and i < 33 or i >= 40 and i < 51 or i >= 52 and i < 55 or i >= 56
+        test.assert_eq(mlx90640.frame_valid(var a), not looked)
+
+@test
+fn test_a_subpage_read_with_a_word_that_met_an_update_is_a_data_error() [io, hw]
+    let p = port()
+    var w = example_frame(609, 0x1901, 0)
+    load_frame(p.c, var w)
+    p.c.mem.insert(0x0700, 0x7FFF)
+    p.c.st.insert(6, 0)
+    var got: MlxWords = Vec.new()
+    test.assert_eq(mlx90640.frame_read(p, var got), mlx90640.ERR_DATA)
+
+@test
+fn test_both_subpages_are_read_and_calculated_into_one_frame() [io, hw, mutate]
+    let p = port()
+    var e = full_eeprom()
+    mlx90640.eeprom_set(var e)
+    var w = frame_words(0, 0x1901)
+    load_frame(p.c, var w)
+    p.c.st.insert(9, 2)
+    var raw: MlxWords = Vec.new()
+    var out: MlxFrame = Vec.new()
+    // The double's next subpage is 0 first: the first clear makes it 1.
+    p.c.st.insert(6, 0)
+    test.assert(mlx90640.capture(p, 1000, var raw, var out))
+    test.assert_eq(out.len(), 768)
+    var zero = 0
+    for i in 0..768
+        if (out[i] as Int) == 0
+            zero = zero + 1
+    test.assert_eq(zero, 0)
+    // The two subpages saw the same words, so a pixel of each reads as the independent
+    // calculation gives, with emissivity 1 and the reflected temperature 8 degrees under
+    // the ambient (it does not matter at emissivity 1).
+    test.assert(near(out[0] as Int as Float / 1000.0, 126.033, 0.01))
+    test.assert(near(out[1] as Int as Float / 1000.0, 116.290, 0.01))
+    test.assert(near(out[367] as Int as Float / 1000.0, 80.216, 0.01))
+    test.assert(near(out[366] as Int as Float / 1000.0, 79.925, 0.01))
+
+@test
+fn test_a_capture_without_an_eeprom_or_with_a_failing_read_is_false() [io, hw, mutate]
+    let p = port()
+    var e: MlxEeprom = Vec.new()
+    mlx90640.eeprom_set(var e)
+    var raw: MlxWords = Vec.new()
+    var out: MlxFrame = Vec.new()
+    test.assert(not mlx90640.capture(p, 1000, var raw, var out))
+    var full = full_eeprom()
+    mlx90640.eeprom_set(var full)
+    // No frame in the double: the second read finds the gain word 0.
+    var w = frame_words(0, 0x1901)
+    load_frame(p.c, var w)
+    p.c.st.insert(7, 1)
+    test.assert(not mlx90640.capture(p, 1000, var raw, var out))
+    // A frame without readings: the calculation refuses.
+    let q = port()
+    q.c.mem.insert(0x800D, 0x1901)
+    test.assert(not mlx90640.capture(q, 1000, var raw, var out))
+    // The second subpage fails.
+    let r = port()
+    var w2 = frame_words(0, 0x1901)
+    load_frame(r.c, var w2)
+    r.c.st.insert(6, 0)
+    fail_at(r.c, 8)
+    test.assert(not mlx90640.capture(r, 1000, var raw, var out))
+
+// ── The ambient temperature ──────────────────────────────────────────
+
+fn tempc(o: ?TempMilliC) -> Int
+    match o
+        Some(t) => t.milli_c
+        None    => -99999
+
+@test
+fn test_the_ambient_temperature_is_read_from_the_auxiliary_area() [io, hw, mutate]
+    let p = port()
+    var e = example_eeprom()
+    mlx90640.eeprom_set(var e)
+    var w = example_frame(609, 0x1901, 0)
+    load_frame(p.c, var w)
+    test.assert_eq(tempc(mlx90640.temp_read_of(p)), 39184)
+    test.assert_eq(log_of(p.c), [2, 0x0700, 64, -1, 2, 0x800D, 1, -1])
+    fail_at(p.c, 1)
+    test.assert_eq(tempc(mlx90640.temp_read_of(p)), -99999)
+    fail_at(p.c, 2)
+    test.assert_eq(tempc(mlx90640.temp_read_of(p)), -99999)
+    // An empty module state has no ambient temperature.
+    var none: MlxEeprom = Vec.new()
+    mlx90640.eeprom_set(var none)
+    test.assert_eq(tempc(mlx90640.temp_read_of(p)), -99999)
+
+@test
+fn test_the_ambient_temperature_of_readings_that_give_a_zero_divisor_is_none() [io, mutate]
+    var e = example_eeprom()
+    test.assert_eq(tempc(mlx90640.ambient_of(var e, 1711, 19442, 0xCCC5, 0x1901)), 39184)
+    test.assert_eq(tempc(mlx90640.ambient_of(var e, 0, 0, 0xCCC5, 0x1901)), -99999)
+    var e2 = example_eeprom()
+    setw(var e2, 0x2433, 0x0068)
+    test.assert_eq(tempc(mlx90640.ambient_of(var e2, 1711, 19442, 0xCCC5, 0x1901)), -99999)
+
+// ── The bus functions ────────────────────────────────────────────────
+
+// The words over the bus: 16-bit register address, high byte first, then data.
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(4, freq)
+
+    @tier(app)
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        logp(self.c, 1)
+        for b in data
+            logp(self.c, b as Int)
+        logp(self.c, -1)
+        if fails(self.c) or addr != 0x33
+            return false
+        let reg = data[0] as Int * 256 + data[1] as Int
+        var i = 2
+        var r = reg
+        while i + 1 < data.len()
+            self.c.mem.insert(r, data[i] as Int * 256 + data[i + 1] as Int)
+            r = r + 1
+            i = i + 2
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        let reg = tx[0] as Int * 256 + tx[1] as Int
+        logp(self.c, 2)
+        logp(self.c, reg)
+        logp(self.c, n)
+        logp(self.c, -1)
+        if fails(self.c) or addr != 0x33
+            return None
+        var out: [u8] = []
+        for i in 0..n / 2
+            let v = at(self.c.mem, reg + i)
+            list.push(out, (v >> 8) as u8)
+            list.push(out, (v & 0xFF) as u8)
+        Some(out)
+
+fn wiring() -> DeviceWiring
+    dev_bus.wiring_i2c(0, 0x33)
+
+@test
+fn test_words_are_read_in_pieces_of_sixteen_and_placed_at_an_index() [io, hw]
+    let c = chip()
+    for i in 0..40
+        c.mem.insert(0x0400 + i, 0x1000 + i)
+    let bus = FakeI2c { c: c }
+    var dst: MlxWords = Vec.new()
+    test.assert(mlx90640.i2c_read_words(bus, wiring(), 0x0400, 40, var dst, 0))
+    test.assert_eq(dst.len(), 40)
+    test.assert_eq(dst[0] as Int, 0x1000)
+    test.assert_eq(dst[39] as Int, 0x1027)
+    // 40 words are pieces of 16, 16 and 8 words: 32, 32 and 16 bytes.
+    test.assert_eq(log_of(c), [2, 0x0400, 32, -1, 2, 0x0410, 32, -1, 2, 0x0420, 16, -1])
+    // Read again over the first words: they are replaced, not appended.
+    log_clear(c)
+    c.mem.insert(0x0400, 0x7777)
+    test.assert(mlx90640.i2c_read_words(bus, wiring(), 0x0400, 4, var dst, 0))
+    test.assert_eq(dst.len(), 40)
+    test.assert_eq(dst[0] as Int, 0x7777)
+    // At an index past the words held: appended.
+    test.assert(mlx90640.i2c_read_words(bus, wiring(), 0x0400, 2, var dst, 40))
+    test.assert_eq(dst.len(), 42)
+
+@test
+fn test_a_read_that_does_not_fit_or_fails_is_refused() [io, hw]
+    let c = chip()
+    let bus = FakeI2c { c: c }
+    var dst: MlxWords = Vec.new()
+    test.assert(not mlx90640.i2c_read_words(bus, wiring(), 0x0400, 835, var dst, 0))
+    test.assert(not mlx90640.i2c_read_words(bus, wiring(), 0x0400, 2, var dst, -1))
+    test.assert(not mlx90640.i2c_read_words(bus, wiring(), 0x0400, 2, var dst, 833))
+    test.assert_eq(log_of(c).len(), 0)
+    fail_at(c, 2)
+    test.assert(not mlx90640.i2c_read_words(bus, wiring(), 0x0400, 40, var dst, 0))
+    test.assert(not mlx90640.i2c_read_words(bus, dev_bus.wiring_i2c(0, 0x34), 0x0400, 2, var dst, 0))
+
+@test
+fn test_a_word_is_written_high_byte_first_and_the_bus_is_set_up() [io, hw]
+    let c = chip()
+    let bus = FakeI2c { c: c }
+    test.assert(mlx90640.i2c_write_word(bus, wiring(), 0x800D, 0x1901))
+    test.assert_eq(log_of(c), [1, 0x80, 0x0D, 0x19, 0x01, -1])
+    test.assert_eq(at(c.mem, 0x800D), 0x1901)
+    test.assert(not mlx90640.i2c_write_word(bus, dev_bus.wiring_i2c(0, 0x34), 0x800D, 1))
+    test.assert(mlx90640.i2c_setup(bus, wiring(), 1000000))
+    test.assert_eq(at(c.st, 4), 1000000)
+    test.assert(not mlx90640.i2c_setup(bus, dev_bus.wiring_spi(0, 4), 400000))
+
+// ── The type over the host's absent bus ──────────────────────────────
+
+fn thermometer_read<T: Thermometer>(t: T) -> ?TempMilliC [hw, mutate]
+    if t.temp_start() < 0
+        return None
+    t.temp_read()
+
+@test
+fn test_the_type_over_absent_hardware() [io, hw, mutate]
+    let d = Mlx90640.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, wiring())
+    var empty: MlxEeprom = Vec.new()
+    mlx90640.eeprom_set(var empty)
+    test.assert(not d.begin())
+    test.assert(d.bus_hz(1000000))
+    // The port's own methods on the type: a write the absent bus does not take, the
+    // timer's clock, and a pause.
+    test.assert(not d.write_word(0x800D, 0x1901))
+    let before = d.now_ms()
+    d.pause_ms(2)
+    test.assert(d.now_ms() >= before)
+    var w: MlxWords = Vec.new()
+    var f: MlxFrame = Vec.new()
+    test.assert(not d.frame(950, var w, var f))
+    test.assert(d.subpage(var w) < 0)
+    test.assert(not d.set_refresh(2))
+    test.assert_eq(d.refresh(), -1)
+    test.assert(not d.set_resolution(2))
+    test.assert_eq(d.resolution(), -1)
+    test.assert(not d.set_chess(true))
+    test.assert(d.device_id() == None)
+    test.assert(not d.device_probe(1))
+    test.assert_eq(d.temp_start(), 0)
+    test.assert(d.temp_read() == None)
+    test.assert(thermometer_read(d) == None)
+    var full = full_eeprom()
+    mlx90640.eeprom_set(var full)
+    test.assert(d.temp_read() == None)
+    test.assert(d.temp_read_after(5, 10) == None)
+    test.assert(d.temp_read_after(15, 10) == None)
+
+@test
+fn test_the_scalar_forms_agree_with_the_frame_forms() [io]
+    var e = example_eeprom()
+    var w = example_frame(609, 0x1901, 0)
+    test.assert(near(mlx90640.vdd_calc(var e, 0xCCC5, 0x1901), mlx90640.vdd_of(var e, var w), 1.0e-12))
+    test.assert(near(mlx90640.ta_calc(var e, 0x06AF, 0x4BF2, 3.3186237373737373), 39.18442378914584, 1.0e-6))
+
+@test
+fn test_the_ranged_estimate_of_the_datasheets_v_ir() [io]
+    var e = example_eeprom()
+    // The estimate 80.3633 is in range 1 (0 to 160 degrees), where the correction is 1 and
+    // the slope is KsTo2: 80.4278 by the datasheet's formula for the second pass.
+    let to = mlx90640.to_ranged(var e, 679.250909123826, 1.1876487360496e-7, 80.363312506592, 9516495632.56)
+    test.assert(near(to, 80.4278, 0.002))
+    // An estimate below zero takes range 0, the slope KsTo1 and the corner -40.
+    let cold = mlx90640.to_ranged(var e, 100.0, 1.1876487360496e-7, -10.0, 9516495632.56)
+    test.assert(cold < 100.0)
+
+@test
+fn test_reg_get_and_ctrl_update_are_the_register_primitives() [io, hw]
+    let p = port()
+    test.assert_eq(mlx90640.reg_get(p, 0x800D), 0x1901)
+    test.assert(mlx90640.ctrl_update(p, 0x0380, 0x0180))
+    test.assert_eq(mlx90640.reg_get(p, 0x800D), 0x1981)
+    fail_at(p.c, 1)
+    test.assert_eq(mlx90640.reg_get(p, 0x800D), -1)

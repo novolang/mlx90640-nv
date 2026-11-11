@@ -1,0 +1,911 @@
+// mlx90640 — Melexis's MLX90640, a 32 by 24 infrared array sensor on I2C: the
+// object temperature of every pixel in millidegrees Celsius, the ambient
+// temperature as devices-nv's `Thermometer`, and the device ID as `Identifiable`.
+//
+// The document is the datasheet "MLX90640 32x24 IR array", 3901090640,
+// revision 13 (the date printed on its pages is October 21, 2026): section
+// 10.7 (the memory map, the status register 0x8000, control register 1 0x800D,
+// the RAM and the EEPROM), section 10.4 and 10.5 (the refresh rate and the
+// measurement flow) and section 11 (the calculation).  The reference driver
+// read for fixes is Melexis's mlx90640-library (functions/MLX90640_API.c, last
+// changed 2023-02-07), and Adafruit_MLX90640 for its port.  The calculation
+// below follows the datasheet's steps in its own words; where the datasheet's
+// worked example (section 11.2) disagrees with its formulas, the test says so.
+//
+// The sensor.  The address is 0x33 and the bus runs to 1 MHz, but the EEPROM is
+// read at 400 kHz at most (datasheet Note 5, Table 5).  Registers and memory are
+// 16 bit words with 16-bit addresses, high byte first.  The RAM at 0x0400 holds
+// the pixels, 768 words; the auxiliary area at 0x0700 holds, among others, Vbe
+// at 0x0700, the compensation pixel of subpage 0 at 0x0708, the gain at 0x070A,
+// PTAT at 0x0720, the compensation pixel of subpage 1 at 0x0728 and the supply
+// voltage reading at 0x072A.  A measurement is half the array, a subpage: in the
+// chess pattern (control bit 12 set, the factory default) the pixels whose
+// row and column parity agree are subpage 0; in the interleaved pattern the even
+// rows are.  Both subpages are needed for a whole image, and the sensor
+// alternates them, subpage 0 first, one every refresh period.  A frame in this
+// package is the 834 words one subpage read leaves in a caller buffer: words 0
+// to 767 are the pixels, 768 to 831 the auxiliary area, 832 the control
+// register and 833 the subpage number.
+//
+// The calculation is done in `Float` (binary64) and not in integers.  The
+// calibration is decoded with integer arithmetic.  The compensation multiplies
+// quantities from about 1e-9 (the pixel sensitivity) to about 1e10 (the fourth
+// power of an absolute temperature) and takes fourth roots, and the datasheet's
+// example is reproduced to a few thousandths of a degree; a 32-bit or 64-bit
+// fixed-point value covers neither the range nor that precision.  The fourth
+// root is a Newton iteration written here, since `math.sqrt` is refused at the
+// embedded tier.  The cost is about 100 floating-point operations a root and
+// three roots a pixel.
+//
+// Pitfalls the reference drivers carry, and what is done here:
+//
+//   - The EEPROM is read in pieces the bus can carry.  Adafruit's port reads
+//     `maxBufferSize / 2` words at a time; here the piece is 16 words, the
+//     size of `dev_bus.DevBytes`.
+//   - Melexis's `MLX90640_GetFrameData` loops until the data-ready bit is set and
+//     never returns when the sensor stops.  `frame_read` waits at most twice the
+//     subpage period and answers a timeout.
+//   - Until 2020 the library read the frame again if the data-ready bit was set
+//     after the read; it now clears the bit before the read and checks the
+//     words afterwards: a word 0x7FFF in the pixels or in the auxiliary area
+//     is a read that met the sensor's own update.  The check is here.
+//   - The status register is cleared by writing 0x0030 (the data-ready bit
+//     cleared, the overwrite enable and the start-of-measurement bit set), the
+//     value the library uses.
+//   - Melexis's write function reads the register back and returns an error if it
+//     differs; `ctrl_update` does the same for the control register.
+//   - Both subpages must be read before the ambient temperature and the
+//     compensation are right, and the refresh rate is the rate of a subpage, so
+//     a frame takes two periods (datasheet section 10.4).
+//   - The frame takes 1,668 bytes and a bus of 400 kHz needs 43 ms for it in
+//     pieces of 32 bytes (3 bytes of addressing in each, 53 pieces).  At a
+//     refresh rate of 32 Hz a subpage is 31 ms, so the bus has to run at 1 MHz
+//     and at 64 Hz the pieces of 32 bytes do not fit even then.
+//   - The library's check for adjacent broken pixels compared pixel numbers and
+//     so called the last pixel of a row and the first of the next adjacent
+//     (fixed upstream in February 2023); `pixel_defect` is per pixel and the
+//     adjacency of two defects is never needed here.
+//   - `1 << ksto_scale` in the library overflowed a 16-bit `int` on some
+//     compilers (fixed upstream in February 2021).  `Int` is 64 bits here.
+//   - The datasheet says the first frames after power-up are not settled:
+//     the thermal behaviour takes up to 4 minutes, and Melexis recommends
+//     reading the 4th and 5th frame after a power-up of an application that
+//     powers the sensor for each reading (section 13.4.1).
+//
+// The EEPROM is kept in module state, one sensor to a program, because the
+// methods of a trait take a plain `self` and so can keep none.  `eeprom_load`
+// fills it; `eeprom_get` and `eeprom_set` read and replace it.
+
+use embedded_hal.{ BoardI2c, BoardTimer, I2cBus, Timer }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_thermo.{ TempMilliC, Thermometer }
+use dev_id.{ DeviceId, Identifiable }
+
+// The 832 words of the EEPROM, from 0x2400.
+pub alias MlxEeprom = Vec[u16; 832]
+
+// A frame: the 834 words one subpage read leaves.
+pub alias MlxWords = Vec[u16; 834]
+
+// The temperatures of the 768 pixels in millidegrees Celsius, row by row, the
+// first row first, the first pixel of a row first, which is the order of the
+// datasheet's figure 3 and of the RAM.
+pub alias MlxFrame = Vec[i32; 768]
+
+// The pixels of the array.
+pub const PIXELS = 768
+
+// The rows of the array.
+pub const ROWS = 24
+
+// The columns of the array.
+pub const COLS = 32
+
+// The 7-bit address at power-up.
+pub const ADDR = 0x33
+
+// What `frame_read` answers when the sensor did not answer.
+pub const ERR_BUS = -1
+
+// What `frame_read` answers when the data did not come in time.
+pub const ERR_TIMEOUT = -2
+
+// What `frame_read` answers when the words read were a read that met an update.
+pub const ERR_DATA = -3
+
+// The value a broken pixel has in a frame before `defects_correct`: absolute zero.
+pub const BROKEN_MILLI_C = -273150
+
+// The registers and memory areas.
+let REG_RAM    = 0x0400
+let REG_AUX    = 0x0700
+let REG_EE     = 0x2400
+let REG_ID     = 0x2407
+let REG_STATUS = 0x8000
+let REG_CTRL   = 0x800D
+
+// The bits of the status register: the data-ready bit and the subpage number.
+let ST_READY   = 0x0008
+let ST_SUBPAGE = 0x0001
+
+// The status value that clears the data-ready bit and enables overwrite.
+let ST_CLEAR = 0x0030
+
+// The fields of control register 1.
+let CTRL_REFRESH_SHIFT = 7
+let CTRL_REFRESH_MASK  = 0x0380
+let CTRL_RES_SHIFT     = 10
+let CTRL_RES_MASK      = 0x0C00
+let CTRL_CHESS         = 0x1000
+
+// The bus clocks.
+let I2C_EEPROM_HZ = 400000
+
+// The words of a read piece: a piece is 16 words, 32 bytes.
+let PIECE = 16
+
+// The indices of the frame words.
+let W_VBE  = 768
+let W_CP0  = 776
+let W_GAIN = 778
+let W_PTAT = 800
+let W_CP1  = 808
+let W_VDD  = 810
+let W_CTRL = 832
+let W_SUB  = 833
+
+// A word that means the read met an update.
+let W_BAD = 0x7FFF
+
+// What a read of the RAM covers: the pixels and the auxiliary area.
+let AUX_WORDS = 64
+
+// The module state: the EEPROM.
+var ee: Vec[u16; 832] = Vec.new()
+
+// What a register read or write needs of the bus.
+pub trait MlxPort
+    fn setup(self, hz: Int) -> Bool [hw]
+    fn read_words(self, reg: Int, n: Int, var dst: MlxWords, at: Int) -> Bool [hw]
+    fn write_word(self, reg: Int, v: Int) -> Bool [hw]
+    fn now_ms(self) -> Int [hw]
+    fn pause_ms(self, ms: Int) [hw]
+
+// ── The bus ──────────────────────────────────────────────────────────
+
+// Reads `n` words from the 16-bit register `reg` into `dst` from index `at`, in
+// pieces of 16 words, each a transaction: whether the sensor answered every
+// piece.  Words that do not fit in `dst` are refused without a transaction.
+pub fn i2c_read_words<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int, var dst: MlxWords,
+                                 at: Int) -> Bool [hw]
+    if at < 0 or at + n > dst.capacity()
+        return false
+    for piece in 0..(n + PIECE - 1) / PIECE
+        let done = piece * PIECE
+        var take = n - done
+        if take > PIECE
+            take = PIECE
+        var b: DevBytes = Vec.new()
+        if not dev_bus.wiring_read16_into(bus, w, reg + done, 2 * take, var b)
+            return false
+        for k in 0..take
+            let v = (b[2 * k] as Int << 8) | b[2 * k + 1] as Int
+            if at + done + k < dst.len()
+                dst[at + done + k] = v as u16
+            else
+                let _ = dst.push(v as u16)
+    true
+
+// Writes one word, high byte first, to the 16-bit register `reg`: whether the
+// sensor acknowledged.
+pub fn i2c_write_word<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, v: Int) -> Bool [hw]
+    var src: DevBytes = Vec.new()
+    let _ = src.push(((v >> 8) & 0xFF) as u8)
+    let _ = src.push((v & 0xFF) as u8)
+    dev_bus.wiring_write16_from(bus, w, reg, src)
+
+// Makes the bus ready at `hz`: whether the wiring has an address.
+pub fn i2c_setup<B: I2cBus>(bus: B, w: DeviceWiring, hz: Int) -> Bool [hw]
+    bus.init(hz)
+    w.addr != None
+
+// ── Decoding ─────────────────────────────────────────────────────────
+
+// The signed value of the low `bits` bits of `v`, two's complement.
+pub fn sx(v: Int, bits: Int) -> Int
+    let half = 1 << (bits - 1)
+    let m = v & ((half << 1) - 1)
+    if m >= half
+        return m - (half << 1)
+    m
+
+// The value of nibble `k`, 1 for the lowest, of a word.
+pub fn nib(v: Int, k: Int) -> Int
+    (v >> (4 * (k - 1))) & 0xF
+
+// Two to the power `n` as a Float, `n` from -62 to 62.
+pub fn pow2(n: Int) -> Float
+    if n >= 0
+        return (1 << n) as Float
+    1.0 / (1 << (0 - n)) as Float
+
+// The square root of a Float: the value is scaled by powers of four into one to
+// four, five Newton steps are taken there, and the scale is undone.  Zero, negative
+// values and values beyond 4 to the 62nd power or under its inverse answer 0.
+pub fn sqrt_f(x: Float) -> Float
+    if x <= 0.0
+        return 0.0
+    var m = x
+    var k = 0
+    for _i in 0..62
+        if m >= 4.0
+            m = m * 0.25
+            k = k + 1
+        elif m < 1.0
+            m = m * 4.0
+            k = k - 1
+    if m >= 4.0 or m < 1.0
+        return 0.0
+    var g = 0.5 * (1.0 + m)
+    for _i in 0..5
+        g = 0.5 * (g + m / g)
+    g * pow2(k)
+
+// The fourth root.
+pub fn root4(x: Float) -> Float
+    sqrt_f(sqrt_f(x))
+
+// A Float in millidegrees as the nearest integer, half away from zero.
+pub fn round_milli(c: Float) -> Int
+    let v = c * 1000.0
+    if v >= 0.0
+        return (v + 0.5) as Int
+    (v - 0.5) as Int
+
+// ── The calibration, from the EEPROM ─────────────────────────────────
+
+// One EEPROM word by its offset from 0x2400.
+fn ew(var e: MlxEeprom, off: Int) -> Int
+    e[off] as Int
+
+// The common values of one subpage read: the supply voltage and the ambient
+// temperature, the gain, the compensated compensation pixels, and what the
+// temperature step needs.
+pub @value
+struct MlxCommon
+    vdd: Float
+    ta: Float
+    gain: Float
+    ir_cp0: Float
+    ir_cp1: Float
+    ta_tr: Float
+    tgc: Float
+    ksta: Float
+    cp_alpha0: Float
+    cp_alpha1: Float
+    emissivity: Float
+
+// The supply voltage in volts (section 11.2.2.2): the reading in the auxiliary
+// area, corrected for the resolution it was taken at, less the factory value at
+// 3.3 V, over the voltage coefficient, added to 3.3 V.  0 when the coefficient is
+// 0.
+pub fn vdd_calc(var e: MlxEeprom, raw_vdd: Int, ctrl: Int) -> Float
+    let e33 = ew(var e, 0x33)
+    let kvdd = sx(e33 >> 8, 8) * 32
+    if kvdd == 0
+        return 0.0
+    let vdd25 = ((e33 & 0xFF) - 256) * 32 - 8192
+    let res_ram = (ctrl >> CTRL_RES_SHIFT) & 3
+    let res_ee = (ew(var e, 0x38) >> 12) & 3
+    let corr = pow2(res_ee - res_ram)
+    (corr * sx(raw_vdd, 16) as Float - vdd25 as Float) / kvdd as Float + 3.3
+
+// The supply voltage of a frame.
+pub fn vdd_of(var e: MlxEeprom, var w: MlxWords) -> Float
+    vdd_calc(var e, w[W_VDD] as Int, w[W_CTRL] as Int)
+
+// The ambient temperature in degrees Celsius (section 11.2.2.3), from the PTAT and
+// Vbe readings and the supply voltage.  0 when the readings give a zero divisor.
+pub fn ta_calc(var e: MlxEeprom, raw_ptat: Int, raw_vbe: Int, vdd: Float) -> Float
+    let ptat = sx(raw_ptat, 16) as Float
+    let vbe = sx(raw_vbe, 16) as Float
+    let alpha_ptat = nib(ew(var e, 0x10), 4) as Float / 4.0 + 8.0
+    let den = ptat * alpha_ptat + vbe
+    let e50 = ew(var e, 0x32)
+    let kt_ptat = sx(e50, 10) as Float / 8.0
+    if den == 0.0 or kt_ptat == 0.0
+        return 0.0
+    let kv_ptat = sx(e50 >> 10, 6) as Float / 4096.0
+    let vptat25 = sx(ew(var e, 0x31), 16) as Float
+    let art = ptat / den * 262144.0
+    (art / (1.0 + kv_ptat * (vdd - 3.3)) - vptat25) / kt_ptat + 25.0
+
+// The ambient temperature of a frame.
+pub fn ta_of(var e: MlxEeprom, var w: MlxWords, vdd: Float) -> Float
+    ta_calc(var e, w[W_PTAT] as Int, w[W_VBE] as Int, vdd)
+
+// The gain factor: the factory gain over the gain read with the frame.  0 when the
+// frame's gain word is 0.
+pub fn gain_of(var e: MlxEeprom, var w: MlxWords) -> Float
+    let g = sx(w[W_GAIN] as Int, 16)
+    if g == 0
+        return 0.0
+    sx(ew(var e, 0x30), 16) as Float / g as Float
+
+// Whether the sensor was calibrated in the chess pattern: bit 11 of the device
+// options word 0x240A is clear.  The datasheet does not describe the word; the
+// bit is the reference driver's.
+pub fn calib_chess(var e: MlxEeprom) -> Bool
+    (ew(var e, 0x0A) & 0x0800) == 0
+
+// The interleave correction coefficients of the EEPROM word 0x2435, in the
+// reference driver's order: C1 for the compensation pixel offset, C2, C3.  Section
+// 11.1.3.1 gives the same fields.
+fn ilc(var e: MlxEeprom, k: Int) -> Float
+    let v = ew(var e, 0x35)
+    if k == 0
+        return sx(v, 6) as Float / 16.0
+    if k == 1
+        return sx(v >> 6, 5) as Float / 2.0
+    sx(v >> 11, 5) as Float / 8.0
+
+// The compensation pixel's offset for subpage `s` (section 11.1.13).
+fn cp_offset(var e: MlxEeprom, s: Int) -> Int
+    let v = ew(var e, 0x3A)
+    let off0 = sx(v, 10)
+    if s == 0
+        return off0
+    sx(v >> 10, 6) + off0
+
+// The compensation pixel's sensitivity for subpage `s` (section 11.1.12).
+fn cp_alpha(var e: MlxEeprom, s: Int) -> Float
+    let v = ew(var e, 0x39)
+    let a0 = sx(v, 10) as Float / pow2(nib(ew(var e, 0x20), 4) + 27)
+    if s == 0
+        return a0
+    (1.0 + sx(v >> 10, 6) as Float / 128.0) * a0
+
+// The values one subpage read gives every pixel of the subpage: the compensated
+// compensation pixels, the ambient temperature and the supply voltage, and the
+// reflected-temperature term of the calculation.  `emissivity` is the object's
+// (above 0, 1 at most), and the reflected temperature is the ambient less `tr_shift`
+// degrees; the datasheet suggests 8 in the open air (section 11.2.2.9).  False when a
+// word of the frame gives a zero divisor, in which case `c` is not filled.
+pub fn common_of(var e: MlxEeprom, var w: MlxWords, emissivity: Float, tr_shift: Float,
+                 var c: MlxCommon) -> Bool
+    let vdd = vdd_of(var e, var w)
+    let gain = gain_of(var e, var w)
+    if vdd == 0.0 or gain == 0.0 or emissivity <= 0.0
+        return false
+    let ta = ta_of(var e, var w, vdd)
+    if ta == 0.0
+        return false
+    let e3b = ew(var e, 0x3B)
+    let e38 = ew(var e, 0x38)
+    let cp_kta = sx(e3b, 8) as Float / pow2(nib(e38, 2) + 8)
+    let cp_kv = sx(e3b >> 8, 8) as Float / pow2(nib(e38, 3))
+    let comp = (1.0 + cp_kta * (ta - 25.0)) * (1.0 + cp_kv * (vdd - 3.3))
+    let same = ((w[W_CTRL] as Int & CTRL_CHESS) != 0) == calib_chess(var e)
+    var off1 = cp_offset(var e, 1) as Float
+    if not same
+        off1 = off1 + ilc(var e, 0)
+    let ir0 = sx(w[W_CP0] as Int, 16) as Float * gain - cp_offset(var e, 0) as Float * comp
+    let ir1 = sx(w[W_CP1] as Int, 16) as Float * gain - off1 * comp
+    let tr = ta - tr_shift
+    let ta4 = (ta + 273.15) * (ta + 273.15) * (ta + 273.15) * (ta + 273.15)
+    let tr4 = (tr + 273.15) * (tr + 273.15) * (tr + 273.15) * (tr + 273.15)
+    let e3c = ew(var e, 0x3C)
+    c = MlxCommon { vdd: vdd, ta: ta, gain: gain, ir_cp0: ir0, ir_cp1: ir1,
+                    ta_tr: tr4 - (tr4 - ta4) / emissivity, tgc: sx(e3c, 8) as Float / 32.0,
+                    ksta: sx(e3c >> 8, 8) as Float / 8192.0, cp_alpha0: cp_alpha(var e, 0),
+                    cp_alpha1: cp_alpha(var e, 1), emissivity: emissivity }
+    true
+
+// ── One pixel ────────────────────────────────────────────────────────
+
+// The pattern, 0 or 1, that decides which subpage reads pixel `p`: in the
+// interleaved pattern the parity of its row, in the chess pattern that parity
+// against the parity of the pixel (section 11.2.2.7).
+pub fn pixel_pattern(p: Int, chess: Bool) -> Int
+    let il = (p / 32) & 1
+    if chess
+        return (il + (p & 1)) & 1
+    il
+
+// The offset of pixel `p` (section 11.1.3): the average, the row and column
+// terms scaled, and the pixel's own count scaled.
+pub fn pixel_offset(var e: MlxEeprom, p: Int) -> Int
+    let row = p / 32
+    let col = p % 32
+    let e10 = ew(var e, 0x10)
+    let occ_row = sx(nib(ew(var e, 0x12 + row / 4), row % 4 + 1), 4)
+    let occ_col = sx(nib(ew(var e, 0x18 + col / 4), col % 4 + 1), 4)
+    let own = sx(ew(var e, 0x40 + p) >> 10, 6)
+    sx(ew(var e, 0x11), 16) + (occ_row << nib(e10, 3)) + (occ_col << nib(e10, 2)) + own * (1 << nib(e10, 1))
+
+// The sensitivity of pixel `p` (section 11.1.4) before the compensation pixel is
+// taken off.
+pub fn pixel_alpha(var e: MlxEeprom, p: Int) -> Float
+    let row = p / 32
+    let col = p % 32
+    let e20 = ew(var e, 0x20)
+    let acc_row = sx(nib(ew(var e, 0x22 + row / 4), row % 4 + 1), 4)
+    let acc_col = sx(nib(ew(var e, 0x28 + col / 4), col % 4 + 1), 4)
+    let own = sx(ew(var e, 0x40 + p) >> 4, 6)
+    let n = ew(var e, 0x21) + (acc_row << nib(e20, 3)) + (acc_col << nib(e20, 2)) + own * (1 << nib(e20, 1))
+    n as Float / pow2(nib(e20, 4) + 30)
+
+// The temperature coefficient Kta of pixel `p` (section 11.1.6).
+pub fn pixel_kta(var e: MlxEeprom, p: Int) -> Float
+    let split = 2 * ((p / 32) & 1) + (p & 1)
+    var rc = 0
+    if split == 0
+        rc = sx(ew(var e, 0x36) >> 8, 8)
+    elif split == 1
+        rc = sx(ew(var e, 0x37) >> 8, 8)
+    elif split == 2
+        rc = sx(ew(var e, 0x36), 8)
+    else
+        rc = sx(ew(var e, 0x37), 8)
+    let e38 = ew(var e, 0x38)
+    let own = sx(ew(var e, 0x40 + p) >> 1, 3)
+    (rc + own * (1 << nib(e38, 1))) as Float / pow2(nib(e38, 2) + 8)
+
+// The voltage coefficient Kv of pixel `p` (section 11.1.5).
+pub fn pixel_kv(var e: MlxEeprom, p: Int) -> Float
+    let split = 2 * ((p / 32) & 1) + (p & 1)
+    let e34 = ew(var e, 0x34)
+    var k = 0
+    if split == 0
+        k = nib(e34, 4)
+    elif split == 1
+        k = nib(e34, 2)
+    elif split == 2
+        k = nib(e34, 3)
+    else
+        k = nib(e34, 1)
+    sx(k, 4) as Float / pow2(nib(ew(var e, 0x38), 3))
+
+// The sensitivity slope of the temperature range `r`, 0 to 3, in the order of the
+// datasheet's ranges 1 to 4 (section 11.1.10): below 0 degrees, 0 to CT3, CT3 to
+// CT4, and above CT4.
+pub fn ksto_of(var e: MlxEeprom, r: Int) -> Float
+    let scale = pow2(nib(ew(var e, 0x3F), 1) + 8)
+    var v = 0
+    if r == 0
+        v = sx(ew(var e, 0x3D), 8)
+    elif r == 1
+        v = sx(ew(var e, 0x3D) >> 8, 8)
+    elif r == 2
+        v = sx(ew(var e, 0x3E), 8)
+    else
+        v = sx(ew(var e, 0x3E) >> 8, 8)
+    v as Float / scale
+
+// The corner temperature CT3 or CT4 in degrees (section 11.1.9).
+pub fn corner_of(var e: MlxEeprom, k: Int) -> Int
+    let v = ew(var e, 0x3F)
+    let step = ((v >> 12) & 3) * 10
+    let ct3 = nib(v, 2) * step
+    if k == 3
+        return ct3
+    ct3 + nib(v, 3) * step
+
+// The first estimate of the object temperature in degrees (section 11.2.2.9): the
+// compensated IR value `ir`, the pixel's sensitivity `alpha`, the slope of the basic
+// range and the reflected-temperature term `ta_tr`.
+pub fn to_basic(ir: Float, alpha: Float, ksto1: Float, ta_tr: Float) -> Float
+    let s = ksto1 * root4(alpha * alpha * alpha * (ir + alpha * ta_tr))
+    root4(ir / (alpha * (1.0 - ksto1 * 273.15) + s) + ta_tr) - 273.15
+
+// The temperature range of an estimate: 0 below 0 degrees, 1 below CT3, 2 below CT4,
+// else 3.
+pub fn range_of(to: Float, ct3: Int, ct4: Int) -> Int
+    if to < 0.0
+        return 0
+    if to < (ct3 as Float)
+        return 1
+    if to < (ct4 as Float)
+        return 2
+    3
+
+// The object temperature in degrees from the estimate's range (section 11.2.2.9.1.3).
+pub fn to_ranged(var e: MlxEeprom, ir: Float, alpha: Float, est: Float, ta_tr: Float) -> Float
+    let ct3 = corner_of(var e, 3)
+    let ct4 = corner_of(var e, 4)
+    let k0 = ksto_of(var e, 0)
+    let k1 = ksto_of(var e, 1)
+    let k2 = ksto_of(var e, 2)
+    let r = range_of(est, ct3, ct4)
+    var corr = 1.0
+    var ks = k1
+    var ct = 0.0
+    if r == 0
+        corr = 1.0 / (1.0 + k0 * 40.0)
+        ks = k0
+        ct = -40.0
+    elif r == 2
+        corr = 1.0 + k1 * ct3 as Float
+        ks = k2
+        ct = ct3 as Float
+    elif r == 3
+        corr = (1.0 + k1 * ct3 as Float) * (1.0 + k2 * (ct4 - ct3) as Float)
+        ks = ksto_of(var e, 3)
+        ct = ct4 as Float
+    root4(ir / (alpha * corr * (1.0 + ks * (est - ct))) + ta_tr) - 273.15
+
+// The object temperature of pixel `p` of the subpage read in `w`, in degrees Celsius.
+// `c` is `common_of` for the same frame.  The pixel must belong to the frame's
+// subpage (`pixel_pattern` equals `w[833]`) and must not be broken.
+pub fn pixel_to(var e: MlxEeprom, var w: MlxWords, c: MlxCommon, p: Int) -> Float
+    let chess = (w[W_CTRL] as Int & CTRL_CHESS) != 0
+    let same = chess == calib_chess(var e)
+    let sub = w[W_SUB] as Int & 1
+    let comp = (1.0 + pixel_kta(var e, p) * (c.ta - 25.0)) * (1.0 + pixel_kv(var e, p) * (c.vdd - 3.3))
+    var ir = sx(w[p] as Int, 16) as Float * c.gain - pixel_offset(var e, p) as Float * comp
+    if not same
+        let il = (p / 32) & 1
+        let conv = ((p + 2) / 4 - (p + 3) / 4 + (p + 1) / 4 - p / 4) * (1 - 2 * il)
+        ir = ir + ilc(var e, 2) * (2 * il - 1) as Float - ilc(var e, 1) * conv as Float
+    var cp = c.ir_cp0
+    var cpa = c.cp_alpha0
+    if sub == 1
+        cp = c.ir_cp1
+        cpa = c.cp_alpha1
+    ir = (ir - c.tgc * cp) / c.emissivity
+    let alpha = (pixel_alpha(var e, p) - c.tgc * cpa) * (1.0 + c.ksta * (c.ta - 25.0))
+    let est = to_basic(ir, alpha, ksto_of(var e, 1), c.ta_tr)
+    to_ranged(var e, ir, alpha, est, c.ta_tr)
+
+// Whether pixel `p` is defective: 1 for a broken pixel, whose EEPROM word is 0, 2
+// for an outlier, whose word has bit 0 set (section 10.7.3 notes 1 and 2), 0 for a
+// good one.
+pub fn pixel_defect(var e: MlxEeprom, p: Int) -> Int
+    let v = ew(var e, 0x40 + p)
+    if v == 0
+        return 1
+    if (v & 1) != 0
+        return 2
+    0
+
+// Calculates the pixels of the subpage in `w` into `out`, in millidegrees Celsius.
+// `out` keeps the pixels of the other subpage; if it is empty it is first filled
+// with zeros.  A broken pixel is set to `BROKEN_MILLI_C`.  False when the frame gives
+// a zero divisor.
+pub fn subpage_to(var e: MlxEeprom, var w: MlxWords, emissivity: Float, tr_shift: Float,
+                  var out: MlxFrame) -> Bool
+    var c = MlxCommon { vdd: 0.0, ta: 0.0, gain: 0.0, ir_cp0: 0.0, ir_cp1: 0.0, ta_tr: 0.0, tgc: 0.0, ksta: 0.0,
+                        cp_alpha0: 0.0, cp_alpha1: 0.0, emissivity: 1.0 }
+    if not common_of(var e, var w, emissivity, tr_shift, var c)
+        return false
+    let chess = (w[W_CTRL] as Int & CTRL_CHESS) != 0
+    let sub = w[W_SUB] as Int & 1
+    for _i in 0..PIXELS
+        if out.len() < PIXELS
+            let _ = out.push(0 as i32)
+    for p in 0..PIXELS
+        if pixel_pattern(p, chess) == sub
+            if pixel_defect(var e, p) == 1
+                out[p] = BROKEN_MILLI_C as i32
+            else
+                out[p] = round_milli(pixel_to(var e, var w, c, p)) as i32
+    true
+
+// The index of the pixel `r` rows and `c` columns from the pixel `p`, or -1 outside
+// the array.
+fn neighbour(p: Int, dr: Int, dc: Int) -> Int
+    let row = p / 32 + dr
+    let col = p % 32 + dc
+    if row < 0 or row >= ROWS or col < 0 or col >= COLS
+        return -1
+    row * 32 + col
+
+// Replaces each defective pixel (broken or outlier) of `out` by the mean of its
+// left, right, upper and lower neighbours that are not defective themselves (the
+// datasheet guarantees no two defective pixels are adjacent): the number of pixels
+// replaced.
+pub fn defects_correct(var e: MlxEeprom, var out: MlxFrame) -> Int
+    var n = 0
+    for p in 0..PIXELS
+        if pixel_defect(var e, p) != 0
+            var sum = 0
+            var cnt = 0
+            for d in 0..4
+                var q = -1
+                if d == 0
+                    q = neighbour(p, 0, -1)
+                elif d == 1
+                    q = neighbour(p, 0, 1)
+                elif d == 2
+                    q = neighbour(p, -1, 0)
+                else
+                    q = neighbour(p, 1, 0)
+                if q >= 0 and pixel_defect(var e, q) == 0
+                    sum = sum + out[q] as Int
+                    cnt = cnt + 1
+            if cnt > 0
+                out[p] = (sum / cnt) as i32
+                n = n + 1
+    n
+
+// ── The registers ────────────────────────────────────────────────────
+
+// Reads a register: its value, or -1 when the sensor did not answer.
+pub fn reg_get<P: MlxPort>(p: P, reg: Int) -> Int [hw]
+    var b: MlxWords = Vec.new()
+    if not p.read_words(reg, 1, var b, 0)
+        return -1
+    b[0] as Int
+
+// Changes the bits of `mask` in control register 1 to those of `bits`, writes it
+// and reads it back (the reference driver's write checks the same): whether the
+// read-back was the value written.
+pub fn ctrl_update<P: MlxPort>(p: P, mask: Int, bits: Int) -> Bool [hw]
+    let cur = reg_get(p, REG_CTRL)
+    if cur < 0
+        return false
+    let v = (cur & (0xFFFF - mask)) | (bits & mask)
+    if not p.write_word(REG_CTRL, v)
+        return false
+    reg_get(p, REG_CTRL) == v
+
+// Sets the refresh rate of a subpage by its code: 0 is 0.5 Hz, 1 is 1 Hz, and so on
+// to 7 for 64 Hz.  Any other code is refused without a write.  The setting takes
+// effect after the subpage being measured.
+pub fn refresh_set<P: MlxPort>(p: P, code: Int) -> Bool [hw]
+    if code < 0 or code > 7
+        return false
+    ctrl_update(p, CTRL_REFRESH_MASK, code << CTRL_REFRESH_SHIFT)
+
+// The refresh code, or -1.
+pub fn refresh_get<P: MlxPort>(p: P) -> Int [hw]
+    let v = reg_get(p, REG_CTRL)
+    if v < 0
+        return -1
+    (v & CTRL_REFRESH_MASK) >> CTRL_REFRESH_SHIFT
+
+// The refresh rate of a code in millihertz: 500 for code 0 up to 64,000 for code 7.
+// -1 outside the codes.
+pub fn refresh_mhz(code: Int) -> Int
+    if code < 0 or code > 7
+        return -1
+    500 << code
+
+// Sets the ADC resolution by its code: 0 is 16 bit, 1 is 17, 2 is 18 (the
+// default) and 3 is 19 bit.  Any other code is refused without a write.
+pub fn resolution_set<P: MlxPort>(p: P, code: Int) -> Bool [hw]
+    if code < 0 or code > 3
+        return false
+    ctrl_update(p, CTRL_RES_MASK, code << CTRL_RES_SHIFT)
+
+// The resolution code, or -1.
+pub fn resolution_get<P: MlxPort>(p: P) -> Int [hw]
+    let v = reg_get(p, REG_CTRL)
+    if v < 0
+        return -1
+    (v & CTRL_RES_MASK) >> CTRL_RES_SHIFT
+
+// Selects the chess pattern (`true`, the factory default) or the interleaved one.
+pub fn chess_set<P: MlxPort>(p: P, chess: Bool) -> Bool [hw]
+    var v = 0
+    if chess
+        v = CTRL_CHESS
+    ctrl_update(p, CTRL_CHESS, v)
+
+// The device ID: the three words 0x2407 to 0x2409 as one number, the first word
+// the most significant.  `None` when the sensor did not answer.
+pub fn id_read<P: MlxPort>(p: P) -> ?DeviceId [hw]
+    var b: MlxWords = Vec.new()
+    if not p.read_words(REG_ID, 3, var b, 0)
+        return None
+    Some(DeviceId { who: (b[0] as Int << 32) | (b[1] as Int << 16) | b[2] as Int, rev: None })
+
+// ── Reading a frame ──────────────────────────────────────────────────
+
+// The period of one subpage in milliseconds for a refresh code.
+fn subpage_ms(code: Int) -> Int
+    2000 >> code
+
+// Reads one subpage into `w`: waits for the data-ready bit (at most twice the
+// subpage period and 10 ms), clears it, and reads the pixels, the auxiliary area and
+// the control register.  The subpage number comes from the status register read
+// before the clear.  Answers the subpage number, 0 or 1, or `ERR_BUS`,
+// `ERR_TIMEOUT` or `ERR_DATA`.
+pub fn frame_read<P: MlxPort>(p: P, var w: MlxWords) -> Int [hw]
+    let code = refresh_get(p)
+    if code < 0
+        return ERR_BUS
+    let limit = 2 * subpage_ms(code) + 10
+    let start = p.now_ms()
+    var st = 0
+    loop
+        st = reg_get(p, REG_STATUS)
+        if st < 0
+            return ERR_BUS
+        if (st & ST_READY) != 0
+            break
+        if p.now_ms() - start >= limit
+            return ERR_TIMEOUT
+        p.pause_ms(1)
+    if not p.write_word(REG_STATUS, ST_CLEAR)
+        return ERR_BUS
+    w.clear()
+    if not p.read_words(REG_RAM, PIXELS, var w, 0)
+        return ERR_BUS
+    if not p.read_words(REG_AUX, AUX_WORDS, var w, PIXELS)
+        return ERR_BUS
+    let ctrl = reg_get(p, REG_CTRL)
+    if ctrl < 0
+        return ERR_BUS
+    let _ = w.push(ctrl as u16)
+    let sub = st & ST_SUBPAGE
+    let _ = w.push(sub as u16)
+    if not frame_valid(var w)
+        return ERR_DATA
+    sub
+
+// Whether the words of a frame hold no 0x7FFF where the reference driver looks for it:
+// the first pixel of each line that belongs to the subpage, and the auxiliary words it
+// checks.
+pub fn frame_valid(var w: MlxWords) -> Bool
+    let sub = w[W_SUB] as Int & 1
+    for line in 0..ROWS
+        if (w[line * 32] as Int) == W_BAD and (line & 1) == sub
+            return false
+    for i in 0..AUX_WORDS
+        let ok = i == 0 or i >= 8 and i < 19 or i >= 20 and i < 23 or i >= 24 and i < 33 or i >= 40 and i < 51 or i >= 52 and i < 55 or i >= 56
+        if ok and (w[W_VBE + i] as Int) == W_BAD
+            return false
+    true
+
+// Reads the EEPROM at 400 kHz into the module state, in pieces of 16 words: whether
+// every piece was read and the calibration is plausible (the words 0x2430 to 0x243F
+// are not all one value).
+pub fn eeprom_load<P: MlxPort>(p: P) -> Bool [hw, mutate]
+    if not p.setup(I2C_EEPROM_HZ)
+        return false
+    var tmp: MlxWords = Vec.new()
+    if not p.read_words(REG_EE, 832, var tmp, 0)
+        return false
+    var same = true
+    for i in 0x31..0x40
+        if tmp[i] != tmp[0x30]
+            same = false
+    if same
+        return false
+    ee.clear()
+    for i in 0..832
+        let _ = ee.push(tmp[i])
+    true
+
+// The EEPROM held in the module state, copied into `out`.
+pub fn eeprom_get(var out: MlxEeprom) [mutate]
+    out.clear()
+    for i in 0..ee.len()
+        let _ = out.push(ee[i])
+
+// Replaces the module state's EEPROM by `src`, which a program that stores a
+// calibration of its own, or a test, does.
+pub fn eeprom_set(var src: MlxEeprom) [mutate]
+    ee.clear()
+    for i in 0..src.len()
+        let _ = ee.push(src[i])
+
+// Reads both subpages, calculates every pixel and puts the frame in `out`: the pixels
+// are millidegrees Celsius.  `emissivity` is the object's, in thousandths (950 for
+// 0.95, the value of Adafruit's port); the reflected temperature is taken as the
+// ambient less 8 degrees (the open-air value of the datasheet).  `w` is the caller's
+// read buffer.  The module state's EEPROM must be loaded.  Whether both subpages were
+// read and calculated.
+pub fn capture<P: MlxPort>(p: P, emissivity_milli: Int, var w: MlxWords,
+                           var out: MlxFrame) -> Bool [hw, mutate]
+    if ee.len() != 832
+        return false
+    out.clear()
+    for _k in 0..2
+        if frame_read(p, var w) < 0
+            return false
+        if not subpage_to(var ee, var w, emissivity_milli as Float / 1000.0, 8.0, var out)
+            return false
+    true
+
+// The ambient temperature in millidegrees from the PTAT, Vbe and supply readings and
+// the control register, or `None` when they give a zero divisor.
+pub fn ambient_of(var e: MlxEeprom, raw_ptat: Int, raw_vbe: Int, raw_vdd: Int,
+                  ctrl: Int) -> ?TempMilliC
+    let vdd = vdd_calc(var e, raw_vdd, ctrl)
+    if vdd == 0.0
+        return None
+    let ta = ta_calc(var e, raw_ptat, raw_vbe, vdd)
+    if ta == 0.0
+        return None
+    Some(TempMilliC { milli_c: round_milli(ta) })
+
+// Reads the auxiliary area and the control register and answers the ambient temperature,
+// or `None` when the sensor did not answer or the module state's EEPROM is not loaded.
+pub fn temp_read_of<P: MlxPort>(p: P) -> ?TempMilliC [hw, mutate]
+    if ee.len() != 832
+        return None
+    var aux: MlxWords = Vec.new()
+    if not p.read_words(REG_AUX, AUX_WORDS, var aux, 0)
+        return None
+    let ctrl = reg_get(p, REG_CTRL)
+    if ctrl < 0
+        return None
+    ambient_of(var ee, aux[W_PTAT - PIXELS] as Int, aux[0] as Int, aux[W_VDD - PIXELS] as Int, ctrl)
+
+// ── The part on a board's I2C bus ────────────────────────────────────
+
+// An MLX90640 on the board's I2C bus at the wiring's address, `ADDR` by default.  The
+// value keeps no state: the calibration is the module's.
+pub @value
+struct Mlx90640
+    bus: BoardI2c
+    timer: BoardTimer
+    w: DeviceWiring
+
+impl MlxPort for Mlx90640
+    fn setup(self, hz: Int) -> Bool [hw]
+        i2c_setup(self.bus, self.w, hz)
+
+    fn read_words(self, reg: Int, n: Int, var dst: MlxWords, at: Int) -> Bool [hw]
+        i2c_read_words(self.bus, self.w, reg, n, var dst, at)
+
+    fn write_word(self, reg: Int, v: Int) -> Bool [hw]
+        i2c_write_word(self.bus, self.w, reg, v)
+
+    fn now_ms(self) -> Int [hw]
+        self.timer.ticks_ms()
+
+    fn pause_ms(self, ms: Int) [hw]
+        self.timer.delay_ms(ms)
+
+impl Mlx90640
+    // The sensor at `w.addr`, as a board's device table builds it.  Nothing is sent.
+    fn attach(bus: BoardI2c, timer: BoardTimer, w: DeviceWiring) -> Mlx90640
+        Mlx90640 { bus: bus, timer: timer, w: w }
+
+    // Opens the bus at 400 kHz and reads the EEPROM into the module state: whether the
+    // sensor answered.
+    fn begin(self) -> Bool [hw, mutate]
+        eeprom_load(self)
+
+    // Opens the bus at `hz`, up to 1 MHz, once the EEPROM is read.
+    fn bus_hz(self, hz: Int) -> Bool [hw]
+        i2c_setup(self.bus, self.w, hz)
+
+    // Reads both subpages and calculates the frame.
+    fn frame(self, emissivity_milli: Int, var w: MlxWords, var out: MlxFrame) -> Bool [hw, mutate]
+        capture(self, emissivity_milli, var w, var out)
+
+    // One subpage read; the subpage number or a negative error.
+    fn subpage(self, var w: MlxWords) -> Int [hw]
+        frame_read(self, var w)
+
+    fn set_refresh(self, code: Int) -> Bool [hw]
+        refresh_set(self, code)
+
+    fn refresh(self) -> Int [hw]
+        refresh_get(self)
+
+    fn set_resolution(self, code: Int) -> Bool [hw]
+        resolution_set(self, code)
+
+    fn resolution(self) -> Int [hw]
+        resolution_get(self)
+
+    fn set_chess(self, chess: Bool) -> Bool [hw]
+        chess_set(self, chess)
+
+impl Thermometer[hw, mutate] for Mlx90640
+    // The ambient temperature is a reading of the sensor's RAM.
+    fn temp_start(self) -> Int [hw, mutate]
+        0
+
+    fn temp_read(self) -> ?TempMilliC [hw, mutate]
+        temp_read_of(self)
+
+impl Identifiable[hw] for Mlx90640
+    // The three ID words 0x2407 to 0x2409 in `who`, the first the most significant.
+    fn device_id(self) -> ?DeviceId [hw]
+        id_read(self)

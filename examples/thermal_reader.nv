@@ -1,0 +1,104 @@
+/* thermal_reader.nv: a reading loop that prints the ambient temperature and the
+ * hottest pixel of an MLX90640 thermal array, about twice a second
+ *
+ * Build:  bash tests/device_build.sh   (the package's own script)
+ *          or make this file the main of a package that depends on
+ *          mlx90640-nv and run
+ *              novo build --target=nrf52840-dk src/main.nv
+ * Run:    probe-rs run --chip nRF52840_xxAA main.elf
+ *
+ * NOT a `novo run` program: it targets a board and never ends.
+ *
+ * The sensor is an MLX90640 on a breakout (Adafruit 4407 or 4469, SparkFun
+ * SEN-14844, Pimoroni): SDA and SCL to the board's first I2C bus, power to 3.3 V
+ * and ground.  The part answers at 0x33.  A line looks like
+ *
+ *     ambient 25 C  hottest 31 C at row 12 col 16
+ *
+ * with whole degrees Celsius, and the row and column counted from 0 at the top
+ * left.
+ *
+ * The program reads the EEPROM once with `begin`, then each pass reads the two
+ * subpages and calculates the 768 pixels into a buffer it owns (`frame`), and
+ * reads the ambient temperature through devices-nv's Thermometer trait.  The
+ * refresh rate is the sensor's default, 2 Hz a subpage, so a frame is two periods.
+ * The bus runs at 400 kHz, which carries the 1,668 bytes of a subpage in about
+ * 43 ms.
+ *
+ * Memory: the program holds a frame of 768 `i32` (3,072 bytes) and the 834 words
+ * of a subpage read (1,668 bytes) in its stack, and the package holds the EEPROM
+ * (1,664 bytes) as static state.  It allocates nothing after it starts.
+ *
+ * Effects the program declares: [hw], for the I2C bus, the UART and the timer, and
+ * [mutate], for the EEPROM the package keeps.
+ *
+ * Boards: the nRF52840 DK and the nRF54LM20 DK build this program, and both drive
+ * I2C with a TWIM (docs/hal/README.md, "The Nordic DKs' buses").  No board on the
+ * bench carries the sensor; it has not been read on a board.
+ */
+use embedded_hal.{ BoardI2c, BoardTimer }
+use dev_thermo.{ TempMilliC, Thermometer }
+use dev_bus
+use mlx90640.{ Mlx90640, MlxWords, MlxFrame }
+
+// Writes `n`, 0 or more, in decimal.  Formatting into a string would allocate,
+// which @tier(embedded) refuses, so each digit goes out as a byte.  An Int has
+// at most 19 decimal digits, which bounds both loops.
+@tier(embedded)
+fn digits(n: Int) [hw]
+    var div = 1
+    for _k in 0..18
+        if div <= n / 10
+            div = div * 10
+    for _k in 0..19
+        if div > 0
+            hal.uart.write_byte(48 + n / div % 10)
+            div = div / 10
+
+// Writes a temperature in whole degrees, rounded toward zero, with a minus sign.
+@tier(embedded)
+fn degrees(milli_c: Int) [hw]
+    var m = milli_c
+    if m < 0
+        hal.uart.write("-")
+        m = -m
+    digits(m / 1000)
+
+// The index of the hottest pixel of the frame.
+@tier(embedded)
+fn hottest(var frame: MlxFrame) -> Int
+    var best = 0
+    for i in 1..768
+        if frame[i] > frame[best]
+            best = i
+    best
+
+@tier(embedded)
+fn main() [hw, mutate]
+    bsp.board.init()
+    let sensor = Mlx90640.attach(BoardI2c { id: 0 }, BoardTimer { id: 0 }, dev_bus.wiring_i2c(0, 0x33))
+    // The part is ready 80 ms after its supply (datasheet section 10.5).
+    hal.timer.delay_ms(80)
+    if not sensor.begin()
+        hal.uart.write("no answer from the sensor at 0x33\n")
+    var raw: MlxWords = Vec.new()
+    var frame: MlxFrame = Vec.new()
+    while true
+        // Emissivity 0.95, the value of Adafruit's port.
+        if sensor.frame(950, var raw, var frame)
+            match sensor.temp_read()
+                Some(t) =>
+                    hal.uart.write("ambient ")
+                    degrees(t.milli_c)
+                None    => hal.uart.write("ambient ?")
+            let h = hottest(var frame)
+            hal.uart.write(" C  hottest ")
+            degrees(frame[h] as Int)
+            hal.uart.write(" C at row ")
+            digits(h / 32)
+            hal.uart.write(" col ")
+            digits(h % 32)
+            hal.uart.write("\n")
+        else
+            hal.uart.write("no answer\n")
+            hal.timer.delay_ms(500)

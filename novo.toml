@@ -1,0 +1,28 @@
+[package]
+name        = "mlx90640-nv"
+version     = "0.1.0"
+description = "A driver for Melexis's MLX90640, a 32 by 24 infrared array sensor on I2C: the 832-word EEPROM read once, a frame read as the two subpages of 834 words into a buffer the caller owns, the object temperature of every pixel in millidegrees Celsius by the datasheet's calculation, the ambient temperature as devices-nv's Thermometer, the refresh rate from 0.5 to 64 Hz, the resolution, the chess and interleaved patterns, the broken and outlier pixels, and the device ID as Identifiable."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["mlx90640", "melexis", "thermal", "infrared", "thermopile", "image-sensor", "i2c", "sensor", "nrf52840-dk", "nrf54lm20-dk"]
+repository  = "https://github.com/novolang/mlx90640-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.1"
+
+# The package is checked at the embedded tier, the strictest one, so
+# every function in it is also valid at rt and system.
+[tier]
+tier = "embedded"
+
+[docs.pages]
+"README.md" = "Reading a Melexis MLX90640 thermal array from a device program"
+
+[dependencies]
+# The board's I2C bus and timer handles, and the I2cBus and Timer traits
+# they implement.
+embedded-hal-nv = "^0.3.3"
+# The Thermometer and Identifiable traits, the wiring record a board's
+# device table hands `attach`, and the register helpers.
+devices-nv      = "^0.3.3"
