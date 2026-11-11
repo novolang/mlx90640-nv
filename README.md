@@ -21,6 +21,14 @@ nRF54LM20 DK and has not been flashed. Its stack use is NOT VERIFIED.
 novo pkg add mlx90640-nv
 ```
 
+The device program is `examples/thermal_reader.nv`.  Make it the `main` of a
+package that depends on this one and build it for a board:
+
+```sh
+novo build --target=nrf52840-dk src/main.nv
+novo build --target=nrf54lm20-dk src/main.nv
+```
+
 ## The device program
 
 `examples/thermal_reader.nv` reads the EEPROM, then reads and calculates a frame about
@@ -200,7 +208,8 @@ CT4; the corner temperatures and slopes are in the EEPROM.
 
 ## Tests
 
-`tests/mlx90640_tests.nv` decodes the calibration of the datasheet's Table 12 and checks the
+`novo test --isolate tests/mlx90640_tests.nv` runs the suite on the host.
+It decodes the calibration of the datasheet's Table 12 and checks the
 supply voltage (3.3186 V), the ambient temperature (39.184 degrees), the gain, the offset
 (-75), the sensitivity (1.26223e-7), the compensation pixel and the first estimate for the
 example's V_IR (80.3633 degrees) against section 11.2.2. The full pixel is checked against an

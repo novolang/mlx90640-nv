@@ -679,15 +679,8 @@ fn test_a_subpage_read_waits_clears_the_bit_and_reads_the_whole_frame() [io, hw]
     test.assert(wrote > 0)
     test.assert_eq(lg[wrote + 2], 0x0030)
     // 768 words for the pixels and 64 for the auxiliary area, a call each.
-    var pixels = 0
-    var aux = 0
-    var i = 0
-    while i < lg.len()
-        if lg[i] == 2 and lg[i + 1] >= 0x0400 and lg[i + 1] < 0x0700
-            pixels = pixels + 1
-        if lg[i] == 2 and lg[i + 1] >= 0x0700 and lg[i + 1] < 0x0740
-            aux = aux + 1
-        i = i + 1
+    let pixels = list.count(list.range(0, lg.len()), i => lg[i] == 2 and lg[i + 1] >= 0x0400 and lg[i + 1] < 0x0700)
+    let aux = list.count(list.range(0, lg.len()), i => lg[i] == 2 and lg[i + 1] >= 0x0700 and lg[i + 1] < 0x0740)
     test.assert_eq(pixels, 1)
     test.assert_eq(aux, 1)
 
