@@ -19,14 +19,15 @@
  * left.
  *
  * The program reads the EEPROM once with `begin`, then each pass reads the two
- * subpages and calculates the 768 pixels into a buffer it owns (`frame`), and
- * reads the ambient temperature through devices-nv's Thermometer trait.  The
+ * subpages and calculates the 768 pixels into a buffer it owns (ThermalImager's
+ * `thermal_read`), and reads the ambient temperature through devices-nv's
+ * Thermometer trait.  The
  * refresh rate is the sensor's default, 2 Hz a subpage, so a frame is two periods.
  * The bus runs at 400 kHz, which carries the 1,668 bytes of a subpage in about
  * 43 ms.
  *
- * Memory: the program holds a frame of 768 `i32` (3,072 bytes) and the 834 words
- * of a subpage read (1,668 bytes) in its stack, and the package holds the EEPROM
+ * Memory: the program holds a frame of 768 `i32` (3,072 bytes) in its stack, `thermal_read`
+ * holds the 834 words of a subpage read (1,668 bytes) in its own frame, and the package holds the EEPROM
  * (1,664 bytes) as static state.  It allocates nothing after it starts.
  *
  * Effects the program declares: [hw], for the I2C bus, the UART and the timer, and
@@ -38,8 +39,9 @@
  */
 use embedded_hal.{ BoardI2c, BoardTimer }
 use dev_thermo.{ TempMilliC, Thermometer }
+use dev_thermal.{ ThermalFrame, ThermalImager }
 use dev_bus
-use mlx90640.{ Mlx90640, MlxWords, MlxFrame }
+use mlx90640.{ Mlx90640 }
 
 // Writes `n`, 0 or more, in decimal.  Formatting into a string would allocate,
 // which @tier(embedded) refuses, so each digit goes out as a byte.  An Int has
@@ -66,7 +68,7 @@ fn degrees(milli_c: Int) [hw]
 
 // The index of the hottest pixel of the frame.
 @tier(embedded)
-fn hottest(var frame: MlxFrame) -> Int
+fn hottest(var frame: ThermalFrame) -> Int
     var best = 0
     for i in 1..768
         if frame[i] > frame[best]
@@ -81,11 +83,11 @@ fn main() [hw, mutate]
     hal.timer.delay_ms(80)
     if not sensor.begin()
         hal.uart.write("no answer from the sensor at 0x33\n")
-    var raw: MlxWords = Vec.new()
-    var frame: MlxFrame = Vec.new()
+    var frame: ThermalFrame = Vec.new()
     while true
-        // Emissivity 0.95, the value of Adafruit's port.
-        if sensor.frame(950, var raw, var frame)
+        // Both subpages at an emissivity of 0.95, the value of Adafruit's port;
+        // `sensor.frame` takes another emissivity.
+        if sensor.thermal_read(var frame)
             match sensor.temp_read()
                 Some(t) =>
                     hal.uart.write("ambient ")

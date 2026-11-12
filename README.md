@@ -42,8 +42,9 @@ ambient 25 C  hottest 31 C at row 12 col 16
 ```novo norun:needs-pkg
 use embedded_hal.{ BoardI2c, BoardTimer }
 use dev_thermo.{ TempMilliC, Thermometer }
+use dev_thermal.{ ThermalFrame, ThermalImager }
 use dev_bus
-use mlx90640.{ Mlx90640, MlxWords, MlxFrame }
+use mlx90640.{ Mlx90640 }
 
 // Writes `n`, 0 or more, in decimal.  Formatting into a string would allocate,
 // which @tier(embedded) refuses, so each digit goes out as a byte.  An Int has
@@ -70,7 +71,7 @@ fn degrees(milli_c: Int) [hw]
 
 // The index of the hottest pixel of the frame.
 @tier(embedded)
-fn hottest(var frame: MlxFrame) -> Int
+fn hottest(var frame: ThermalFrame) -> Int
     var best = 0
     for i in 1..768
         if frame[i] > frame[best]
@@ -85,11 +86,11 @@ fn main() [hw, mutate]
     hal.timer.delay_ms(80)
     if not sensor.begin()
         hal.uart.write("no answer from the sensor at 0x33\n")
-    var raw: MlxWords = Vec.new()
-    var frame: MlxFrame = Vec.new()
+    var frame: ThermalFrame = Vec.new()
     while true
-        // Emissivity 0.95, the value of Adafruit's port.
-        if sensor.frame(950, var raw, var frame)
+        // Both subpages at an emissivity of 0.95, the value of Adafruit's port;
+        // `sensor.frame` takes another emissivity.
+        if sensor.thermal_read(var frame)
             match sensor.temp_read()
                 Some(t) =>
                     hal.uart.write("ambient ")
@@ -120,8 +121,8 @@ probe-rs run --chip nRF52840_xxAA main.elf
 
 | Image | Flash | Of which program |
 |---|---|---|
-| `nrf52840-dk` | 24,732 B | 13,330 B |
-| `nrf54lm20-dk` | 26,180 B | 13,746 B |
+| `nrf52840-dk` | 24,668 B | 13,276 B |
+| `nrf54lm20-dk` | 26,132 B | 13,708 B |
 
 The numbers are from the build's memory report. Flash also holds the runtime and the
 compiler's support library, which includes the soft floating-point routines the calculation
@@ -144,9 +145,17 @@ A reply from the sensor over a DK's bus is NOT VERIFIED until the driver rig car
 
 A subpage is read into an `MlxWords`, a `Vec[u16; 834]`: words 0 to 767 are the pixels, 768
 to 831 the auxiliary area (Vbe, the compensation pixels, the gain, PTAT and the supply
-reading), 832 the control register and 833 the subpage number. `Mlx90640.frame` reads both
-subpages, calculates the pixels of each and fills an `MlxFrame`, a `Vec[i32; 768]` of
-millidegrees Celsius, row by row from the top left. The reflected temperature is taken as the
+reading), 832 the control register and 833 the subpage number.
+
+`Mlx90640` implements devices-nv's `ThermalImager`: `thermal_cols()` and
+`thermal_rows()` answer 32 and 24, `thermal_start()` answers the time an image takes (two
+subpage periods; the sensor measures continuously, so nothing is started), and
+`thermal_rate_mhz()` the images a second in thousandths, half the subpage rate.
+`thermal_read(var out)` reads both subpages, calculates the pixels of each at an emissivity
+of 0.95 and fills `out`, a `ThermalFrame` (`Vec[i32; 768]`, which `MlxFrame` names too) of
+millidegrees Celsius, row by row from the top left; its working buffer of 834 words is in the
+method's own frame.  `Mlx90640.frame(emissivity_milli, var w, var out)` is the richer form:
+another emissivity and the caller's read buffer.  The reflected temperature is taken as the
 ambient less 8 degrees, the open-air value of the datasheet (section 11.2.2.9).
 
 The package keeps the EEPROM, 832 words, in module state, so a program has one sensor.
@@ -198,12 +207,22 @@ CT4; the corner temperatures and slopes are in the EEPROM.
   the I2C configuration register 0x800F.
 - A calculation without floating point.
 
+## Where the traits fall short
+
+- The compensation runs in binary64 `Float`, and the embedded tier refuses `math.sqrt`, so
+  the fourth root is a Newton iteration in the package.
+- The calibration is module state, because a trait method takes a plain `self` that holds
+  no state, so `ThermalImager` and `Thermometer` are implemented with `[hw, mutate]` and
+  so is every caller.
+- `ThermalImager` has no async form, because the embedded tier refuses `async fn`; the
+  sensor measures in the background, so a program reads at the frame rate.
+
 ## Related packages
 
 - [amg8833-nv](https://novo-lang.org/packages/amg8833-nv) reads a thermal array of 8 by 8
   pixels.
-- [devices-nv](https://novo-lang.org/packages/devices-nv) defines `Thermometer` and
-  `Identifiable`; [embedded-hal-nv](https://novo-lang.org/packages/embedded-hal-nv) defines
+- [devices-nv](https://novo-lang.org/packages/devices-nv) defines `Thermometer`,
+  `ThermalImager` and `Identifiable`; [embedded-hal-nv](https://novo-lang.org/packages/embedded-hal-nv) defines
   `I2cBus` and `Timer`.
 
 ## Tests

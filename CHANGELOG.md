@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+The package takes devices-nv and embedded-hal-nv by path until 0.4.0 is published.
+
+- `Mlx90640` implements devices-nv's `ThermalImager`, with the effect list
+  `[hw, mutate]`: `thermal_cols` (32), `thermal_rows` (24), `thermal_start` (the time an
+  image takes, two subpage periods, and -1 when the sensor does not answer),
+  `thermal_read` and `thermal_rate_mhz` (half the subpage rate).  `thermal_read` reads both
+  subpages and calculates the image at an emissivity of 0.95 (`EMISSIVITY_MILLI`) with its
+  working buffer in its own frame; on `false` the buffer is empty.
+- `Mlx90640.frame(emissivity_milli, var w, var out)` stays as the richer form, with another
+  emissivity and the caller's read buffer.
+- `MlxFrame` is now an alias of devices-nv's `ThermalFrame`, the same `Vec[i32; 768]`.
+- New module functions `thermal_capture`, `image_us` and `image_rate_mhz`.
+
 ## 0.1.0
 
 The first release: a driver for Melexis's MLX90640 32 by 24 infrared array sensor.

@@ -1,6 +1,7 @@
 // mlx90640 — Melexis's MLX90640, a 32 by 24 infrared array sensor on I2C: the
 // object temperature of every pixel in millidegrees Celsius, the ambient
-// temperature as devices-nv's `Thermometer`, and the device ID as `Identifiable`.
+// temperature as devices-nv's `Thermometer`, the image as its `ThermalImager`, and
+// the device ID as `Identifiable`.
 //
 // The document is the datasheet "MLX90640 32x24 IR array", 3901090640,
 // revision 13 (the date printed on its pages is October 21, 2026): section
@@ -73,12 +74,15 @@
 //     powers the sensor for each reading (section 13.4.1).
 //
 // The EEPROM is kept in module state, one sensor to a program, because the
-// methods of a trait take a plain `self` and so can keep none.  `eeprom_load`
+// methods of a trait take a plain `self` and so can keep none, which forces
+// [hw, mutate] on every caller (planning/PERIPHERAL-DRIVER-CANDIDATES.md § 3.5,
+// row "Magnetometer", the same shape).  `eeprom_load`
 // fills it; `eeprom_get` and `eeprom_set` read and replace it.
 
 use embedded_hal.{ BoardI2c, BoardTimer, I2cBus, Timer }
 use dev_bus.{ DeviceWiring, DevBytes }
 use dev_thermo.{ TempMilliC, Thermometer }
+use dev_thermal.{ ThermalFrame, ThermalImager }
 use dev_id.{ DeviceId, Identifiable }
 
 // The 832 words of the EEPROM, from 0x2400.
@@ -89,8 +93,8 @@ pub alias MlxWords = Vec[u16; 834]
 
 // The temperatures of the 768 pixels in millidegrees Celsius, row by row, the
 // first row first, the first pixel of a row first, which is the order of the
-// datasheet's figure 3 and of the RAM.
-pub alias MlxFrame = Vec[i32; 768]
+// datasheet's figure 3 and of the RAM.  It is devices-nv's `ThermalFrame`.
+pub alias MlxFrame = ThermalFrame
 
 // The pixels of the array.
 pub const PIXELS = 768
@@ -103,6 +107,10 @@ pub const COLS = 32
 
 // The 7-bit address at power-up.
 pub const ADDR = 0x33
+
+// The emissivity `thermal_read` takes, in thousandths: 0.95, the value of Adafruit's
+// port.  `Mlx90640.frame` takes another.
+pub const EMISSIVITY_MILLI = 950
 
 // What `frame_read` answers when the sensor did not answer.
 pub const ERR_BUS = -1
@@ -229,6 +237,10 @@ pub fn pow2(n: Int) -> Float
         return (1 << n) as Float
     1.0 / (1 << (0 - n)) as Float
 
+// Stays in the package: planning/PERIPHERAL-DRIVER-CANDIDATES.md § 3.5, row "the
+// embedded tier" (`math.sqrt` is refused there, and the compensation runs in
+// binary64 `Float`).
+//
 // The square root of a Float: the value is scaled by powers of four into one to
 // four, five Newton steps are taken there, and the scale is undone.  Zero, negative
 // values and values beyond 4 to the 62nd power or under its inverse answer 0.
@@ -809,6 +821,32 @@ pub fn capture<P: MlxPort>(p: P, emissivity_milli: Int, var w: MlxWords,
             return false
     true
 
+// Reads both subpages and calculates the frame at the emissivity `EMISSIVITY_MILLI`
+// into `out`, with the read buffer held in this function's own frame: whether both
+// subpages were read and calculated.  On `false`, `out` is empty.
+pub fn thermal_capture<P: MlxPort>(p: P, var out: ThermalFrame) -> Bool [hw, mutate]
+    var w: MlxWords = Vec.new()
+    if capture(p, EMISSIVITY_MILLI, var w, var out)
+        return true
+    out.clear()
+    false
+
+// The time an image takes in microseconds: two subpages, each one refresh period;
+// -1 when the sensor did not answer.
+pub fn image_us<P: MlxPort>(p: P) -> Int [hw]
+    let code = refresh_get(p)
+    if code < 0
+        return -1
+    2 * subpage_ms(code) * 1000
+
+// The images a second in thousandths: half the subpage rate, since an image is two
+// subpages; 0 when the sensor did not answer.
+pub fn image_rate_mhz<P: MlxPort>(p: P) -> Int [hw]
+    let code = refresh_get(p)
+    if code < 0
+        return 0
+    refresh_mhz(code) / 2
+
 // The ambient temperature in millidegrees from the PTAT, Vbe and supply readings and
 // the control register, or `None` when they give a zero divisor.
 pub fn ambient_of(var e: MlxEeprom, raw_ptat: Int, raw_vbe: Int, raw_vdd: Int,
@@ -874,7 +912,9 @@ impl Mlx90640
     fn bus_hz(self, hz: Int) -> Bool [hw]
         i2c_setup(self.bus, self.w, hz)
 
-    // Reads both subpages and calculates the frame.
+    // Reads both subpages and calculates the frame at the emissivity
+    // `emissivity_milli`, with the caller's read buffer `w`: the richer form of
+    // `thermal_read`.
     fn frame(self, emissivity_milli: Int, var w: MlxWords, var out: MlxFrame) -> Bool [hw, mutate]
         capture(self, emissivity_milli, var w, var out)
 
@@ -896,6 +936,28 @@ impl Mlx90640
 
     fn set_chess(self, chess: Bool) -> Bool [hw]
         chess_set(self, chess)
+
+impl ThermalImager[hw, mutate] for Mlx90640
+    fn thermal_cols(self) -> Int [hw, mutate]
+        COLS
+
+    fn thermal_rows(self) -> Int [hw, mutate]
+        ROWS
+
+    // The sensor measures continuously, one subpage every refresh period, so there
+    // is nothing to start; the answer is how long an image takes (two periods), and
+    // -1 when the sensor did not answer.
+    fn thermal_start(self) -> Int [hw, mutate]
+        image_us(self)
+
+    // Both subpages and the compensation, at the emissivity `EMISSIVITY_MILLI`; the
+    // read buffer is held in `thermal_capture`'s frame.  The pixels are row by row.
+    // `frame` takes another emissivity and the caller's buffer.
+    fn thermal_read(self, var out: ThermalFrame) -> Bool [hw, mutate]
+        thermal_capture(self, var out)
+
+    fn thermal_rate_mhz(self) -> Int [hw, mutate]
+        image_rate_mhz(self)
 
 impl Thermometer[hw, mutate] for Mlx90640
     // The ambient temperature is a reading of the sensor's RAM.

@@ -35,6 +35,7 @@ use std.test
 use embedded_hal.{ BoardI2c, BoardTimer, I2cBus }
 use dev_bus.{ DeviceWiring }
 use dev_thermo.{ TempMilliC, Thermometer }
+use dev_thermal.{ ThermalFrame, ThermalImager }
 use dev_id.{ DeviceId, Identifiable }
 use mlx90640
 use mlx90640.{ Mlx90640, MlxPort, MlxEeprom, MlxWords, MlxFrame, MlxCommon }
@@ -771,6 +772,77 @@ fn test_both_subpages_are_read_and_calculated_into_one_frame() [io, hw, mutate]
     test.assert(near(out[366] as Int as Float / 1000.0, 79.925, 0.01))
 
 @test
+fn test_the_thermal_read_is_a_capture_at_950_per_mille_with_its_own_buffer() [io, hw, mutate]
+    var e = full_eeprom()
+    mlx90640.eeprom_set(var e)
+    var w = frame_words(0, 0x1901)
+    let p = port()
+    load_frame(p.c, var w)
+    p.c.st.insert(9, 2)
+    p.c.st.insert(6, 0)
+    var a: ThermalFrame = Vec.new()
+    test.assert(mlx90640.thermal_capture(p, var a))
+    test.assert_eq(a.len(), 768)
+    // The same sensor read through `capture` at 950 gives the same image.
+    let q = port()
+    load_frame(q.c, var w)
+    q.c.st.insert(9, 2)
+    q.c.st.insert(6, 0)
+    var raw: MlxWords = Vec.new()
+    var b: MlxFrame = Vec.new()
+    test.assert(mlx90640.capture(q, mlx90640.EMISSIVITY_MILLI, var raw, var b))
+    var same = true
+    for i in 0..768
+        if a[i] != b[i]
+            same = false
+    test.assert(same)
+    // And not the image at an emissivity of 1: the reflected temperature counts.
+    let r = port()
+    load_frame(r.c, var w)
+    r.c.st.insert(9, 2)
+    r.c.st.insert(6, 0)
+    var c1: MlxFrame = Vec.new()
+    test.assert(mlx90640.capture(r, 1000, var raw, var c1))
+    test.assert(a[0] != c1[0])
+
+@test
+fn test_a_thermal_capture_that_fails_leaves_the_buffer_empty() [io, hw, mutate]
+    let p = port()
+    var e: MlxEeprom = Vec.new()
+    mlx90640.eeprom_set(var e)
+    var out: ThermalFrame = Vec.new()
+    let _ = out.push(7 as i32)
+    test.assert(not mlx90640.thermal_capture(p, var out))
+    test.assert_eq(out.len(), 0)
+    // The second subpage fails after the first filled half the image.
+    var full = full_eeprom()
+    mlx90640.eeprom_set(var full)
+    let r = port()
+    var w2 = frame_words(0, 0x1901)
+    load_frame(r.c, var w2)
+    r.c.st.insert(6, 0)
+    fail_at(r.c, 8)
+    test.assert(not mlx90640.thermal_capture(r, var out))
+    test.assert_eq(out.len(), 0)
+
+@test
+fn test_an_image_takes_two_subpage_periods_and_runs_at_half_the_subpage_rate() [io, hw]
+    let p = port()
+    // 0x1901 is refresh code 2, 2 Hz: a subpage every 500 ms.
+    test.assert_eq(mlx90640.image_us(p), 1000000)
+    test.assert_eq(mlx90640.image_rate_mhz(p), 1000)
+    test.assert(mlx90640.refresh_set(p, 0))
+    test.assert_eq(mlx90640.image_us(p), 4000000)
+    test.assert_eq(mlx90640.image_rate_mhz(p), 250)
+    test.assert(mlx90640.refresh_set(p, 7))
+    test.assert_eq(mlx90640.image_us(p), 30000)
+    test.assert_eq(mlx90640.image_rate_mhz(p), 32000)
+    fail_at(p.c, 1)
+    test.assert_eq(mlx90640.image_us(p), -1)
+    fail_at(p.c, 1)
+    test.assert_eq(mlx90640.image_rate_mhz(p), 0)
+
+@test
 fn test_a_capture_without_an_eeprom_or_with_a_failing_read_is_false() [io, hw, mutate]
     let p = port()
     var e: MlxEeprom = Vec.new()
@@ -957,6 +1029,14 @@ fn test_the_type_over_absent_hardware() [io, hw, mutate]
     test.assert(not d.set_resolution(2))
     test.assert_eq(d.resolution(), -1)
     test.assert(not d.set_chess(true))
+    var tf: ThermalFrame = Vec.new()
+    test.assert(not d.thermal_read(var tf))
+    test.assert_eq(tf.len(), 0)
+    test.assert_eq(d.thermal_cols(), 32)
+    test.assert_eq(d.thermal_rows(), 24)
+    test.assert_eq(d.thermal_start(), -1)
+    test.assert_eq(d.thermal_rate_mhz(), 0)
+    test.assert(not d.thermal_read_after(5, 10, var tf))
     test.assert(d.device_id() == None)
     test.assert(not d.device_probe(1))
     test.assert_eq(d.temp_start(), 0)
