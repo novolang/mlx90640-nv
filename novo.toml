@@ -1,6 +1,6 @@
 [package]
 name        = "mlx90640-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "A driver for Melexis's MLX90640, a 32 by 24 infrared array sensor on I2C: the 832-word EEPROM read once, a frame read as the two subpages of 834 words into a buffer the caller owns, the object temperature of every pixel in millidegrees Celsius by the datasheet's calculation, the ambient temperature as devices-nv's Thermometer, the refresh rate from 0.5 to 64 Hz, the resolution, the chess and interleaved patterns, the broken and outlier pixels, and the device ID as Identifiable."
 license     = "Apache-2.0"
 stability   = "experimental"
